@@ -1,0 +1,27 @@
+services:
+  jupyterhub:
+    build: .
+    container_name: jupyterhub
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:rw"
+      - "jhub_data:/srv/jupyterhub"
+      - ./jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
+    environment:
+      DOCKER_NETWORK_NAME: nginxproxy_energyguard_net
+      DOCKER_NOTEBOOK_IMAGE: jupyter/base-notebook:latest
+    networks:
+      - nginxproxy_energyguard_net
+
+volumes:
+  jhub_data:
+
+networks:
+  nginxproxy_energyguard_net:
+    external: true
+    name: nginxproxy_energyguard_net
+
