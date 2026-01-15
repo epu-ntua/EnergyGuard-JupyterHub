@@ -1,0 +1,29 @@
+FROM jupyter/base-notebook:latest
+
+USER root
+
+# Packages
+RUN pip install --no-cache-dir \
+    mlflow \
+    minio \
+    boto3 \
+    s3fs \
+    python-dotenv \
+    pyarrow \
+    pandas \
+    numpy \
+    matplotlib \
+    scikit-learn \
+    tqdm \
+    requests
+
+RUN python -m ipykernel install \
+    --name eg-default \
+    --display-name "EnergyGuard (Python)" \
+    --prefix=/usr/local
+
+RUN mkdir -p /etc/jupyter && \
+    printf "c.MappingKernelManager.default_kernel_name = 'eg-default'\n" \
+      > /etc/jupyter/jupyter_server_config.py
+
+USER ${NB_UID}

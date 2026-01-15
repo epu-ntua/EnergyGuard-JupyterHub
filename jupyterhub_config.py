@@ -62,14 +62,14 @@ c.JupyterHub.trust_xheaders = True
 
 # ---------------- Spawner (Docker) ----------------
 c.JupyterHub.spawner_class = DockerSpawner
-c.DockerSpawner.image = os.environ.get("DOCKER_NOTEBOOK_IMAGE", "jupyter/base-notebook:latest")
-
+c.DockerSpawner.image = os.environ.get("DOCKER_NOTEBOOK_IMAGE")
 notebook_dir = "/home/jovyan/work"
 c.DockerSpawner.notebook_dir = notebook_dir
 c.DockerSpawner.volumes = {"jhub-user-{username}": notebook_dir}
 
 c.DockerSpawner.network_name = os.environ.get("DOCKER_NETWORK_NAME", "nginxproxy_energyguard_net")
 c.DockerSpawner.use_internal_ip = True
+c.DockerSpawner.remove = True
 
 c.JupyterHub.hub_ip = "0.0.0.0"
 c.JupyterHub.hub_connect_ip = "jupyterhub"
