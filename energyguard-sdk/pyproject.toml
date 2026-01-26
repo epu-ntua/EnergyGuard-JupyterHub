@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "energyguard-sdk"
+version = "0.1.0"
+dependencies = ["requests"]
+
+[tool.setuptools]
+packages = ["mlflow_sso"]
+py-modules = ["sitecustomize"]

@@ -2,20 +2,23 @@ FROM jupyter/base-notebook:latest
 
 USER root
 
-# Packages
 RUN pip install --no-cache-dir \
-    mlflow \
-    minio \
-    boto3 \
-    s3fs \
-    python-dotenv \
-    pyarrow \
-    pandas \
-    numpy \
-    matplotlib \
-    scikit-learn \
-    tqdm \
-    requests
+    mlflow==3.8.1 \
+    minio==7.2.20 \
+    boto3==1.42.34 \
+    python-dotenv==1.2.1 \
+    pyarrow==22.0.0 \
+    torch==2.10.0 \
+    pandas==2.3.3 \
+    numpy==2.4.1 \
+    matplotlib==3.10.8 \
+    scikit-learn==1.8.0 \
+    tqdm==4.67.1\
+    requests==2.32.5
+
+# Copy SDK source into image and install it
+COPY energyguard-sdk /tmp/energyguard-sdk
+RUN pip install --no-cache-dir /tmp/energyguard-sdk
 
 RUN python -m ipykernel install \
     --name eg-default \
@@ -25,5 +28,9 @@ RUN python -m ipykernel install \
 RUN mkdir -p /etc/jupyter && \
     printf "c.MappingKernelManager.default_kernel_name = 'eg-default'\n" \
       > /etc/jupyter/jupyter_server_config.py
+
+ENV EG_MLFLOW_SSO_AUTO=1
+ENV EG_MLFLOW_SSO_DEBUG=1
+ENV MLFLOW_TRACKING_URI=https://mlflow.energy-guard.eu
 
 USER ${NB_UID}

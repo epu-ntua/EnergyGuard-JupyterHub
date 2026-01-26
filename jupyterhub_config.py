@@ -27,7 +27,7 @@ c.GenericOAuthenticator.userdata_method = "GET"
 
 
 # Basic scopes + username claim
-c.GenericOAuthenticator.scope = ["openid", "profile", "email"]
+c.GenericOAuthenticator.scope = ["openid", "profile", "email", "offline_access"]
 c.GenericOAuthenticator.username_claim = "preferred_username"
 
 # Allow all authenticated users (tighten later with groups if you want)
@@ -40,7 +40,8 @@ c.GenericOAuthenticator.allow_all = True
 # c.GenericOAuthenticator.admin_groups = {"energyguard-admins"}   # example
 
 # Optional but useful if you want tokens available to spawner / services
-# c.Authenticator.enable_auth_state = True
+c.Authenticator.enable_auth_state = True
+c.Authenticator.refresh_pre_spawn = True 
 
 # instead of c.GenericOAuthenticator.logout_redirect_url = ...
 
@@ -59,6 +60,22 @@ c.JupyterHub.db_url = "sqlite:////srv/jupyterhub/jupyterhub.sqlite"
 
 # If you're behind Nginx Proxy Manager / reverse proxy, honor forwarded headers
 c.JupyterHub.trust_xheaders = True
+
+# Needed so the single-user server (with JUPYTERHUB_API_TOKEN) can read its own auth_state
+c.JupyterHub.load_roles = [
+    {
+        "name": "user",
+        "scopes": ["self", "admin:auth_state!user"],
+    },
+    {
+        "name": "server",
+        "scopes": [
+            "users:activity!user",
+            "access:servers!server",
+            "admin:auth_state!user",
+        ],
+    },
+]
 
 # ---------------- Spawner (Docker) ----------------
 c.JupyterHub.spawner_class = DockerSpawner
