@@ -1,6 +1,7 @@
 import os
 from dockerspawner import DockerSpawner
 from urllib.parse import quote
+from dotenv import dotenv_values
 
 c = get_config()
 
@@ -27,7 +28,7 @@ c.GenericOAuthenticator.userdata_method = "GET"
 
 
 # Basic scopes + username claim
-c.GenericOAuthenticator.scope = ["openid", "profile", "email", "offline_access"]
+c.GenericOAuthenticator.scope = ["openid", "profile", "email", "groups", "offline_access"]
 c.GenericOAuthenticator.username_claim = "preferred_username"
 
 # Allow all authenticated users (tighten later with groups if you want)
@@ -61,6 +62,18 @@ c.JupyterHub.db_url = "sqlite:////srv/jupyterhub/jupyterhub.sqlite"
 # If you're behind Nginx Proxy Manager / reverse proxy, honor forwarded headers
 c.JupyterHub.trust_xheaders = True
 
+# Enable cross-site logout iframe compatibility (Keycloak front-channel logout).
+# Security tradeoff: SameSite=None allows cookie sending in third-party contexts.
+cookie_samesite = os.environ.get("JH_COOKIE_SAMESITE", "none").strip().lower()
+cookie_secure = os.environ.get("JH_COOKIE_SECURE", "true").strip().lower() in {"1", "true", "yes", "on"}
+if cookie_samesite not in {"none", "lax", "strict", ""}:
+    cookie_samesite = "none"
+
+cookie_options = {"secure": cookie_secure}
+if cookie_samesite:
+    cookie_options["samesite"] = cookie_samesite
+c.JupyterHub.tornado_settings = {"cookie_options": cookie_options}
+
 # Needed so the single-user server (with JUPYTERHUB_API_TOKEN) can read its own auth_state
 c.JupyterHub.load_roles = [
     {
@@ -83,7 +96,9 @@ c.DockerSpawner.image = os.environ.get("DOCKER_NOTEBOOK_IMAGE")
 notebook_dir = "/home/jovyan/work"
 c.DockerSpawner.notebook_dir = notebook_dir
 c.DockerSpawner.volumes = {"jhub-user-{username}": notebook_dir}
-
+singleuser_env = dotenv_values("/srv/env/.env.singleuserr")
+print(singleuser_env)
+c.DockerSpawner.environment = dict(singleuser_env)
 c.DockerSpawner.network_name = os.environ.get("DOCKER_NETWORK_NAME", "nginxproxy_energyguard_net")
 c.DockerSpawner.use_internal_ip = True
 c.DockerSpawner.remove = True

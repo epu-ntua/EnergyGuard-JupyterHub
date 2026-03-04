@@ -175,7 +175,7 @@ def install_requests_patch() -> None:
             resp = original(self, method, url, **kwargs)
 
             # If we got HTML login page or rejection, refresh token and retry once
-            if _looks_like_keycloak_login(resp) or resp.status_code in (401, 403):
+            if _looks_like_keycloak_login(resp) or resp.status_code in (401, 403, 500):
                 _debug(
                     f"MLflow auth failed (status={resp.status_code}, html={_looks_like_keycloak_login(resp)}). "
                     "Refreshing token and retrying once."
