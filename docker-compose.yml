@@ -11,6 +11,9 @@ services:
       - "/var/run/docker.sock:/var/run/docker.sock:rw"
       - "jhub_data:/srv/jupyterhub"
       - ./jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
+      # Shared data dir: DMS writes here; pre_spawn_hook creates per-user subdirs
+      # so that DockerSpawner can bind-mount them into singleuser containers.
+      - /home/energyguard/jupyterhub_data:/jupyterhub_data
     networks:
       - nginxproxy_energyguard_net
 
