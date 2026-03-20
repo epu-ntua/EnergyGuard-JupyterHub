@@ -122,7 +122,7 @@ The energyguard-sdk solves the following problem: **MLflow is protected behind K
 
 ### From the User's Perspective
 
-Users write standard MLflow code with zero authentication boilerplate:
+Users write standard MLflow code with no extra authentication code required:
 
 ```python
 import mlflow
