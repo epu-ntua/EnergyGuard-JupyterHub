@@ -33,7 +33,7 @@ RUN mkdir -p /etc/jupyter && \
 # COPY .env.singleuser /srv/jupyterhub/.env.singleuser
 
 ENV EG_MLFLOW_SSO_AUTO=1
-ENV EG_MLFLOW_SSO_DEBUG=1
+ENV EG_MLFLOW_SSO_DEBUG=0
 ENV MLFLOW_S3_ENDPOINT_URL=https://minio-backend.energy-guard.eu/
 ENV MLFLOW_TRACKING_URI=https://mlflow.energy-guard.eu/
 USER ${NB_UID}

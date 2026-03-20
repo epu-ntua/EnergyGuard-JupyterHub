@@ -111,8 +111,8 @@ c.JupyterHub.hub_connect_ip = "jupyterhub"
 # ---------------- Dataset / Notebook provisioning ----------------
 # The Data Management Server writes datasets and notebooks to a shared
 # directory on the host: /home/energyguard/jupyterhub_data/
-#   datasets/{username}/{dataset_name}/  →  mounted read-only  at /home/jovyan/datasets
-#   notebooks/{username}/               →  mounted read-write at /home/jovyan/notebooks
+#   datasets/{username}/{dataset_name}/  →  mounted read-only  at /home/jovyan/work/datasets
+#   notebooks/{username}/               →  mounted read-write at /home/jovyan/work/notebooks
 #
 # The JupyterHub container itself has /home/energyguard/jupyterhub_data
 # bind-mounted as /jupyterhub_data (see docker-compose.yml), so the hook
@@ -122,6 +122,9 @@ _JHUB_DATA_HOST = os.environ.get(
     "JUPYTERHUB_DATA_HOST_PATH", "/home/energyguard/jupyterhub_data"
 )
 _JHUB_DATA_CONTAINER = "/jupyterhub_data"  # as mounted in this JupyterHub container
+
+DATASET_DIR_MODE = 0o755
+NOTEBOOK_DIR_MODE = 0o777
 
 
 async def pre_spawn_hook(spawner):
@@ -134,12 +137,14 @@ async def pre_spawn_hook(spawner):
     notebooks_container_path = Path(_JHUB_DATA_CONTAINER) / "notebooks" / username
     datasets_container_path.mkdir(parents=True, exist_ok=True)
     notebooks_container_path.mkdir(parents=True, exist_ok=True)
+    os.chmod(datasets_container_path, DATASET_DIR_MODE)
+    os.chmod(notebooks_container_path, NOTEBOOK_DIR_MODE)
 
     # Tell DockerSpawner to bind-mount the host paths into the singleuser container.
     datasets_host = f"{_JHUB_DATA_HOST}/datasets/{username}"
     notebooks_host = f"{_JHUB_DATA_HOST}/notebooks/{username}"
-    spawner.volumes[datasets_host] = {"bind": "/home/jovyan/datasets", "mode": "ro"}
-    spawner.volumes[notebooks_host] = {"bind": "/home/jovyan/notebooks", "mode": "rw"}
+    spawner.volumes[datasets_host] = {"bind": "/home/jovyan/work/datasets", "mode": "ro"}
+    spawner.volumes[notebooks_host] = {"bind": "/home/jovyan/work/notebooks", "mode": "rw"}
 
 
 c.Spawner.pre_spawn_hook = pre_spawn_hook
