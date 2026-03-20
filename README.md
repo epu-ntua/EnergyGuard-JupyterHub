@@ -48,7 +48,7 @@ Key aspects:
 - **Auth state persistence:** Enabled (`enable_auth_state = True`). The user's Keycloak access token is stored in JupyterHub's auth state and made available to singleuser containers. This is critical for the MLflow SSO integration described below.
 <!-- - **Logout:** Configured to perform Keycloak front-channel logout so users are signed out of all connected services. -->
 
-Custom roles grant singleuser servers permission to read the spawning user's auth state (and only of that user):
+Custom roles grant singleuser servers permission to read the spawning user's auth state (and only of that user)
 
 - **`user` role** — scopes: `self`, `admin:auth_state!user`
 - **`server` role** — scopes: `users:activity!user`, `access:servers!server`, `admin:auth_state!user`
