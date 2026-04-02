@@ -10,13 +10,13 @@ RUN pip install --no-cache-dir \
     "dockerspawner==13.*" \
     "oauthenticator" \
     "jupyterlab==4.*" \
-    "dotenv"
+    "dotenv" \
+    "httpx"
 
 # Create config dir + copy config from build context
 RUN mkdir -p /srv/jupyterhub
 RUN mkdir -p /srv/env
 COPY ./jupyterhub_config.py /srv/jupyterhub/jupyterhub_config.py
-COPY ./.env.singleuser /srv/env/.env.singleuser
 
 WORKDIR /srv/jupyterhub
 CMD ["jupyterhub", "-f", "./jupyterhub_config.py"]
