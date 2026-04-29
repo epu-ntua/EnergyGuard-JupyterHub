@@ -14,7 +14,8 @@ RUN pip install --no-cache-dir \
     matplotlib==3.10.8 \
     scikit-learn==1.8.0 \
     tqdm==4.67.1\
-    requests==2.32.5
+    requests==2.32.5\
+    pytorch_lightning==2.6.1
 
 # Copy SDK source into image and install it
 COPY energyguard-sdk /tmp/energyguard-sdk

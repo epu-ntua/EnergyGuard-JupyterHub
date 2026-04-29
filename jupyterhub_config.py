@@ -46,7 +46,7 @@ c.Authenticator.refresh_pre_spawn = True
 
 # Check token validity every 30 seconds — the refresh_user hook below will
 # also check the revocation file written by the backchannel logout server.
-c.OAuthenticator.auth_refresh_age = 30
+c.OAuthenticator.auth_refresh_age = 36000
 
 # Logout: redirect to Keycloak end-session endpoint (triggers backchannel to other apps)
 post = "https://jupyterhub.energy-guard.eu/hub/login?next=%2Fhub%2F"
@@ -58,7 +58,7 @@ c.OAuthenticator.logout_redirect_url = (
 
 
 # ---------------- Hub basics ----------------
-c.JupyterHub.bind_url = "http://0.0.0.0:8000"
+c.JupyterHub.bind_url = "http://0.0.0.0:8009"
 c.JupyterHub.cookie_secret_file = "/srv/jupyterhub/jupyterhub_cookie_secret"
 c.JupyterHub.db_url = "sqlite:////srv/jupyterhub/jupyterhub.sqlite"
 
@@ -215,7 +215,7 @@ async def _refresh_user(authenticator, user, auth_state):
     _bcl_logger.info("refresh_user called for user=%s", user.name)
     if _is_user_revoked(user.name):
         revocation_ts = _get_revocation_time(user.name)
-        # Check if the user re-authenticated AFTER the revocation
+        # Check if the user re-authenticated after the revocation
         if auth_state and auth_state.get("access_token"):
             token_payload = _decode_jwt_payload(auth_state["access_token"])
             iat = token_payload.get("iat", 0)
@@ -262,28 +262,38 @@ def _delete_user_tokens_via_api(username: str) -> int:
             data = resp.json()
             # API returns {"api_tokens": [...]} not a bare list
             tokens = data.get("api_tokens", []) if isinstance(data, dict) else data
-            _bcl_logger.info("Found %d tokens for %s", len(tokens), username)
 
-            # Delete each token
-            for token in tokens:
-                if isinstance(token, dict):
-                    token_id = token.get("id", "")
-                else:
-                    token_id = str(token)
+            # Delete only OAuth tokens (browser session). Skip API tokens —
+            # the singleuser server's JUPYTERHUB_API_TOKEN is one of them, and
+            # deleting it leaves the running container unable to talk to the
+            # Hub (403 "Missing or invalid credentials").
+            oauth_tokens = [
+                t for t in tokens
+                if isinstance(t, dict) and (
+                    t.get("kind") == "oauth" or t.get("oauth_client")
+                )
+            ]
+            _bcl_logger.info(
+                "Found %d total tokens, %d OAuth tokens for %s",
+                len(tokens), len(oauth_tokens), username,
+            )
+
+            for token in oauth_tokens:
+                token_id = token.get("id", "")
                 del_resp = client.delete(
                     f"{_JHUB_API_URL}/users/{username}/tokens/{token_id}",
                     headers=headers,
                 )
                 if del_resp.status_code in (200, 204):
                     deleted += 1
-                    _bcl_logger.info("Deleted token %s for %s", token_id, username)
+                    _bcl_logger.info("Deleted OAuth token %s for %s", token_id, username)
                 else:
                     _bcl_logger.warning("Failed to delete token %s: %s %s", token_id, del_resp.status_code, del_resp.text[:200])
     except Exception as e:
         _bcl_logger.error("Error deleting tokens for %s: %s", username, e)
         return -1
 
-    _bcl_logger.info("Deleted %d/%d tokens for %s", deleted, len(tokens), username)
+    _bcl_logger.info("Deleted %d/%d OAuth tokens for %s", deleted, len(oauth_tokens), username)
     return deleted
 
 
