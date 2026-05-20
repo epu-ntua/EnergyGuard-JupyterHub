@@ -231,7 +231,7 @@ async def _refresh_user(authenticator, user, auth_state):
     _bcl_logger.info("refresh_user: %s not revoked, proceeding with default refresh", user.name)
     return None
 
-c.GenericOAuthenticator.refresh_user_hook = _refresh_user
+# c.GenericOAuthenticator.refresh_user_hook = _refresh_user /uncomment for BCL
 
 
 # ---------------------------------------------------------------------------
@@ -374,14 +374,15 @@ def _start_bcl_server():
     server.serve_forever()
 
 
-threading.Thread(target=_start_bcl_server, daemon=True).start()
+# threading.Thread(target=_start_bcl_server, daemon=True).start() /uncomment for BCL
 
 
 # ---------------------------------------------------------------------------
 # Backchannel logout service — registered with JupyterHub so it can call the
 # REST API to delete user tokens (invalidating the singleuser cookie).
 # ---------------------------------------------------------------------------
-_BCL_API_TOKEN = os.environ.get("BCL_API_TOKEN", "")
+# _BCL_API_TOKEN = os.environ.get("BCL_API_TOKEN", "") /uncomment for BCL
+_BCL_API_TOKEN = ""
 if _BCL_API_TOKEN:
     c.JupyterHub.services = [
         {
@@ -426,7 +427,7 @@ c.DockerSpawner.use_internal_ip = True
 c.DockerSpawner.remove = True
 # Reduce the singleuser server's auth token cache from 300s (default) to 30s
 # so that revoked tokens are detected quickly after backchannel logout.
-c.DockerSpawner.args = ["--HubOAuth.cache_max_age=30"]
+c.DockerSpawner.args = ["--HubOAuth.cache_max_age=3600"]
 
 c.JupyterHub.hub_ip = "0.0.0.0"
 c.JupyterHub.hub_connect_ip = "jupyterhub"
