@@ -3,6 +3,7 @@ FROM jupyter/base-notebook:latest
 USER root
 
 RUN pip install --no-cache-dir \
+    jupyterhub==4.1.6 \
     mlflow==3.8.1 \
     minio==7.2.20 \
     boto3==1.42.34 \

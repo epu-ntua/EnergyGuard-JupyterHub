@@ -46,7 +46,7 @@ c.Authenticator.refresh_pre_spawn = True
 
 # Check token validity every 30 seconds — the refresh_user hook below will
 # also check the revocation file written by the backchannel logout server.
-c.OAuthenticator.auth_refresh_age = 36000
+c.OAuthenticator.auth_refresh_age = 30
 
 # Logout: redirect to Keycloak end-session endpoint (triggers backchannel to other apps)
 post = "https://jupyterhub.energy-guard.eu/hub/login?next=%2Fhub%2F"
@@ -62,12 +62,14 @@ c.JupyterHub.bind_url = "http://0.0.0.0:8009"
 c.JupyterHub.cookie_secret_file = "/srv/jupyterhub/jupyterhub_cookie_secret"
 c.JupyterHub.db_url = "sqlite:////srv/jupyterhub/jupyterhub.sqlite"
 
-# If you're behind Nginx Proxy Manager / reverse proxy, honor forwarded headers
-c.JupyterHub.trust_xheaders = True
-
-# Cookie security settings (no max_age — session expiry is handled by auth_refresh_age)
+# Tornado-level settings. xheaders=True makes JupyterHub honor
+# X-Forwarded-Proto/Host from Nginx Proxy Manager so OAuth redirects use the
+# correct external scheme/host. cookie_options carries the Secure flag.
 cookie_secure = os.environ.get("JH_COOKIE_SECURE", "true").strip().lower() in {"1", "true", "yes", "on"}
-c.JupyterHub.tornado_settings = {"cookie_options": {"secure": cookie_secure}}
+c.JupyterHub.tornado_settings = {
+    "cookie_options": {"secure": cookie_secure},
+    "xheaders": True,
+}
 
 
 # =========================================================================
@@ -197,7 +199,28 @@ def _is_user_revoked(username: str) -> bool:
 # refresh_user hook — runs inside JupyterHub's process every auth_refresh_age
 # seconds when the user makes a Hub request.  Returning False clears the
 # session cookie and forces re-authentication.
+#
+# Just returning False is not enough in practice: clear_login_cookie only
+# clears cookies that exactly match name+path+domain, and we've seen
+# browsers end up holding a leftover hub-login cookie at the wrong path
+# that doesn't get cleared. That causes the next request to *re-identify*
+# the user from the stale cookie, fire refresh_user → False again, and
+# loop forever after a different user logs in on the same browser.
+#
+# We fix that by rotating the *revoked user's cookie_id* in the JupyterHub
+# DB. Every signed JupyterHub cookie embeds cookie_id; JupyterHub looks the
+# user up via `User.cookie_id == cookie_id_from_cookie`. After rotation, any
+# stale cookie in the browser fails that lookup, the request becomes
+# anonymous, and the bounce-to-login resolves cleanly — letting the new
+# user's fresh OIDC set a clean cookie unimpeded.
 # ---------------------------------------------------------------------------
+from jupyterhub.utils import new_token as _new_token
+
+# Users whose cookie_id we've already rotated in this revocation cycle.
+# Reset when the revocation entry is cleared. Guarded by _revocation_lock.
+_rotated_users: set[str] = set()
+
+
 def _get_revocation_time(username: str) -> float:
     """Return the revocation timestamp for *username*, or 0."""
     revocations = _read_revocations()
@@ -209,6 +232,40 @@ def _clear_revocation(username: str) -> None:
         revocations = _read_revocations()
         revocations.pop(username.lower(), None)
         _write_revocations(revocations)
+        _rotated_users.discard(username.lower())
+
+
+def _rotate_cookie_id_once(user) -> bool:
+    """Invalidate the user's existing signed Hub cookies, once per revocation.
+
+    Mutates ``user.orm_user.cookie_id`` to a fresh random value and commits.
+    Subsequent ``orm.User.cookie_id == old`` lookups return None, so the
+    browser's stale ``jupyterhub-hub-login`` cookie becomes a no-op.
+    """
+    key = user.name.lower()
+    with _revocation_lock:
+        if key in _rotated_users:
+            return False
+        _rotated_users.add(key)
+
+    try:
+        orm_user = getattr(user, "orm_user", None)
+        db = getattr(user, "db", None)
+        if orm_user is None or db is None:
+            _bcl_logger.warning(
+                "Cannot rotate cookie_id for %s: ORM user/db not accessible",
+                user.name,
+            )
+            return False
+        orm_user.cookie_id = _new_token()
+        db.commit()
+        _bcl_logger.info(
+            "Rotated cookie_id for %s — stale Hub cookies now invalid", user.name
+        )
+        return True
+    except Exception as exc:                                # noqa: BLE001
+        _bcl_logger.error("Failed to rotate cookie_id for %s: %s", user.name, exc)
+        return False
 
 
 async def _refresh_user(authenticator, user, auth_state):
@@ -226,12 +283,13 @@ async def _refresh_user(authenticator, user, auth_state):
                 )
                 _clear_revocation(user.name)
                 return None
+        _rotate_cookie_id_once(user)
         _bcl_logger.info("refresh_user: REVOKING session for %s — returning False", user.name)
         return False
     _bcl_logger.info("refresh_user: %s not revoked, proceeding with default refresh", user.name)
     return None
 
-# c.GenericOAuthenticator.refresh_user_hook = _refresh_user /uncomment for BCL
+c.GenericOAuthenticator.refresh_user_hook = _refresh_user
 
 
 # ---------------------------------------------------------------------------
@@ -374,15 +432,14 @@ def _start_bcl_server():
     server.serve_forever()
 
 
-# threading.Thread(target=_start_bcl_server, daemon=True).start() /uncomment for BCL
+threading.Thread(target=_start_bcl_server, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
 # Backchannel logout service — registered with JupyterHub so it can call the
 # REST API to delete user tokens (invalidating the singleuser cookie).
 # ---------------------------------------------------------------------------
-# _BCL_API_TOKEN = os.environ.get("BCL_API_TOKEN", "") /uncomment for BCL
-_BCL_API_TOKEN = ""
+_BCL_API_TOKEN = os.environ.get("BCL_API_TOKEN", "")
 if _BCL_API_TOKEN:
     c.JupyterHub.services = [
         {
@@ -413,6 +470,108 @@ if _BCL_API_TOKEN:
         "scopes": ["admin:users", "tokens", "read:users"],
     })
 
+
+# ---------------------------------------------------------------------------
+# Cross-user next-URL guard
+# ---------------------------------------------------------------------------
+# After login JupyterHub redirects to whatever ?next= was in the login URL.
+# If user B lands on user A's stale URL (typical after BCL leaves the
+# address bar pointing at /user/aliceA/...), the post-login redirect would
+# send B to /user/aliceA/... — which gets stuck in a per-user-OAuth bounce
+# loop. From the user's perspective: "stuck in login."
+#
+# Wrap BaseHandler.get_next_url so we never redirect a freshly-authenticated
+# user to a URL belonging to a different user; fall back to the user's own
+# server URL in that case.
+# ---------------------------------------------------------------------------
+from urllib.parse import unquote, urlsplit, parse_qs
+from jupyterhub.handlers.base import BaseHandler
+from oauthenticator.oauth2 import OAuthCallbackHandler
+
+_PER_USER_OAUTH_PREFIX = "jupyterhub-user-"
+
+
+def _cross_user_target(next_url, user):
+    """Return the *other* user's name if next_url targets them, else None.
+
+    Catches two distinct ways JupyterHub embeds a username in a redirect:
+
+      1. Direct path: /user/<other>/...
+      2. Per-user OAuth authorize: /hub/api/oauth2/authorize
+         ?client_id=jupyterhub-user-<other>&redirect_uri=/user/<other>/oauth_callback
+
+    Both happen after BCL when the browser was sitting on a deep link to
+    the previous user's server.
+    """
+    if not next_url:
+        return None
+
+    # (1) /user/<name>/...
+    if next_url.startswith("/user/"):
+        parts = next_url.split("/", 3)
+        if len(parts) >= 3:
+            path_user = unquote(parts[2])
+            if path_user not in {user.name, user.escaped_name}:
+                return path_user
+
+    # (2) /hub/api/oauth2/authorize?client_id=jupyterhub-user-<name>&...
+    if next_url.startswith("/hub/api/oauth2/authorize"):
+        try:
+            qs = parse_qs(urlsplit(next_url).query)
+        except ValueError:
+            return None
+        for cid in qs.get("client_id", []):
+            if cid.startswith(_PER_USER_OAUTH_PREFIX):
+                # parse_qs decoded once; the username may still be percent-
+                # encoded (e.g. "greece%40gmail.com"). Normalize then compare.
+                client_user = unquote(cid[len(_PER_USER_OAUTH_PREFIX):])
+                if client_user not in {user.name, user.escaped_name}:
+                    return client_user
+
+    return None
+
+
+def _rewrite_if_cross_user(handler, user, next_url):
+    if not user or not next_url:
+        return next_url
+    other = _cross_user_target(next_url, user)
+    if other:
+        _bcl_logger.info(
+            "Rewriting cross-user next=%s for %s (was for %s)",
+            next_url, user.name, other,
+        )
+        return handler.hub.base_url + "user/" + user.escaped_name + "/"
+    return next_url
+
+
+# (a) BaseHandler.get_next_url — generic path used by /hub/login, the user
+# spawn-pending handler, etc.
+_original_base_get_next_url = BaseHandler.get_next_url
+
+
+def _base_get_next_url_owner_safe(self, user=None, default=None):
+    next_url = _original_base_get_next_url(self, user=user, default=default)
+    return _rewrite_if_cross_user(self, user, next_url)
+
+
+BaseHandler.get_next_url = _base_get_next_url_owner_safe
+
+
+# (b) OAuthCallbackHandler.get_next_url — oauthenticator overrides get_next_url
+# on the OIDC callback handler to restore next_url from the OAuth state cookie.
+# That codepath BYPASSES BaseHandler.get_next_url via MRO. We have to patch
+# it separately or cross-user redirects on the post-OIDC redirect leak through.
+_original_oauth_get_next_url = OAuthCallbackHandler.get_next_url
+
+
+def _oauth_get_next_url_owner_safe(self, user=None):
+    next_url = _original_oauth_get_next_url(self, user=user)
+    return _rewrite_if_cross_user(self, user, next_url)
+
+
+OAuthCallbackHandler.get_next_url = _oauth_get_next_url_owner_safe
+
+
 # ---------------- Spawner (Docker) ----------------
 c.JupyterHub.spawner_class = DockerSpawner
 c.DockerSpawner.image = os.environ.get("DOCKER_NOTEBOOK_IMAGE")
@@ -427,7 +586,7 @@ c.DockerSpawner.use_internal_ip = True
 c.DockerSpawner.remove = True
 # Reduce the singleuser server's auth token cache from 300s (default) to 30s
 # so that revoked tokens are detected quickly after backchannel logout.
-c.DockerSpawner.args = ["--HubOAuth.cache_max_age=3600"]
+c.DockerSpawner.args = ["--HubOAuth.cache_max_age=30"]
 
 c.JupyterHub.hub_ip = "0.0.0.0"
 c.JupyterHub.hub_connect_ip = "jupyterhub"
