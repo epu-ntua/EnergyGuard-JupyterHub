@@ -450,6 +450,10 @@ _JHUB_DATA_CONTAINER = "/jupyterhub_data"  # as mounted in this JupyterHub conta
 
 DATASET_DIR_MODE = 0o755
 NOTEBOOK_DIR_MODE = 0o777
+# Auth dir stores the per-user mlflow-oidc-auth PAT cache. Writeable by
+# jovyan inside the container (UID 1000). The token file itself is written
+# 0o600 by the SDK.
+AUTH_DIR_MODE = 0o777
 
 
 async def pre_spawn_hook(spawner):
@@ -460,16 +464,21 @@ async def pre_spawn_hook(spawner):
     # singleuser container.
     datasets_container_path = Path(_JHUB_DATA_CONTAINER) / "datasets" / username
     notebooks_container_path = Path(_JHUB_DATA_CONTAINER) / "notebooks" / username
+    auth_container_path = Path(_JHUB_DATA_CONTAINER) / "auth" / username
     datasets_container_path.mkdir(parents=True, exist_ok=True)
     notebooks_container_path.mkdir(parents=True, exist_ok=True)
+    auth_container_path.mkdir(parents=True, exist_ok=True)
     os.chmod(datasets_container_path, DATASET_DIR_MODE)
     os.chmod(notebooks_container_path, NOTEBOOK_DIR_MODE)
+    os.chmod(auth_container_path, AUTH_DIR_MODE)
 
     # Tell DockerSpawner to bind-mount the host paths into the singleuser container.
     datasets_host = f"{_JHUB_DATA_HOST}/datasets/{username}"
     notebooks_host = f"{_JHUB_DATA_HOST}/notebooks/{username}"
+    auth_host = f"{_JHUB_DATA_HOST}/auth/{username}"
     spawner.volumes[datasets_host] = {"bind": "/home/jovyan/work/datasets", "mode": "ro"}
     spawner.volumes[notebooks_host] = {"bind": "/home/jovyan/work/notebooks", "mode": "rw"}
+    spawner.volumes[auth_host] = {"bind": "/srv/eg-auth", "mode": "rw"}
 
 
 c.Spawner.pre_spawn_hook = pre_spawn_hook
