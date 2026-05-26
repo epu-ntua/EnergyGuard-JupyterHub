@@ -71,6 +71,10 @@ c.JupyterHub.tornado_settings = {
     "xheaders": True,
 }
 
+# Silence the per-request "Setting new xsrf cookie" INFO log — it fires on
+# nearly every Hub request and drowns more useful lines. WARNING+ still shows.
+logging.getLogger("jupyterhub._xsrf_utils").setLevel(logging.WARNING)
+
 
 # =========================================================================
 # Backchannel Logout (SSO)
@@ -293,6 +297,50 @@ c.GenericOAuthenticator.refresh_user_hook = _refresh_user
 
 
 # ---------------------------------------------------------------------------
+# Catch natural session expiry (Keycloak SSO idle / max-lifespan timeouts)
+# ---------------------------------------------------------------------------
+# The refresh_user_hook above only rotates the cookie_id when a user is in
+# the BCL revocation file — i.e. for explicit Keycloak logouts that arrived
+# via the backchannel endpoint. Keycloak sessions also die quietly when they
+# hit SSO Session Idle / Max Lifespan, with no BCL POST. Same for any session
+# that ended while the BCL endpoint was disabled.
+#
+# In those cases OAuthenticator.refresh_user notices the dead refresh_token
+# (HTTP 400 invalid_grant) and returns False — but the stale browser cookie
+# still maps to the user's cookie_id in the DB, so the next login from the
+# same browser gets identified as the dead user and bounces back to login
+# in an OAuth loop.
+#
+# Wrap GenericOAuthenticator.refresh_user so any False result also rotates
+# the cookie_id, neutralizing the stale browser cookie regardless of how
+# the session ended.
+# ---------------------------------------------------------------------------
+from oauthenticator.generic import GenericOAuthenticator
+
+_original_authenticator_refresh_user = GenericOAuthenticator.refresh_user
+
+
+async def _refresh_user_with_rotation(self, user, *args, **kwargs):
+    result = await _original_authenticator_refresh_user(self, user, *args, **kwargs)
+    if result is False:
+        _bcl_logger.info(
+            "GenericOAuthenticator.refresh_user returned False for %s — "
+            "rotating cookie_id to invalidate stale browser cookies",
+            user.name,
+        )
+        _rotate_cookie_id_once(user)
+    else:
+        # Refresh succeeded (True/dict/None). Drop any stale rotation-dedup
+        # entry so a future expiry of this same user can rotate again.
+        with _revocation_lock:
+            _rotated_users.discard(user.name.lower())
+    return result
+
+
+GenericOAuthenticator.refresh_user = _refresh_user_with_rotation
+
+
+# ---------------------------------------------------------------------------
 # Delete user tokens via JupyterHub REST API (invalidates singleuser cookie)
 # ---------------------------------------------------------------------------
 _JHUB_API_URL = "http://127.0.0.1:8081/hub/api"
@@ -318,22 +366,30 @@ def _delete_user_tokens_via_api(username: str) -> int:
                 _bcl_logger.warning("Failed to list tokens for %s: %s %s", username, resp.status_code, resp.text[:200])
                 return -1
             data = resp.json()
-            # API returns {"api_tokens": [...]} not a bare list
-            tokens = data.get("api_tokens", []) if isinstance(data, dict) else data
-
-            # Delete only OAuth tokens (browser session). Skip API tokens —
-            # the singleuser server's JUPYTERHUB_API_TOKEN is one of them, and
-            # deleting it leaves the running container unable to talk to the
-            # Hub (403 "Missing or invalid credentials").
-            oauth_tokens = [
-                t for t in tokens
-                if isinstance(t, dict) and (
-                    t.get("kind") == "oauth" or t.get("oauth_client")
-                )
-            ]
+            # JupyterHub 4.x splits the response into two lists by kind:
+            #   "api_tokens"  → kind in {user, service, server}
+            #   "oauth_tokens" → kind == "oauth"  (the browser-session tokens)
+            #
+            # We only want to invalidate the browser session for the singleuser
+            # server — that's "oauth_tokens". Server tokens (which include the
+            # running container's JUPYTERHUB_API_TOKEN) MUST be preserved, or
+            # the live notebook container immediately starts getting 403
+            # "Missing or invalid credentials" on its /activity pings.
+            #
+            # IMPORTANT: do NOT filter api_tokens by `oauth_client`. Server
+            # tokens have an oauth_client linkage to the per-user OAuth client
+            # (jupyterhub-user-<name>), so any filter that keys off
+            # oauth_client truthiness will delete them too.
+            if isinstance(data, dict):
+                api_tokens = data.get("api_tokens", [])
+                oauth_tokens = data.get("oauth_tokens", [])
+            else:
+                # Older JupyterHub: flat list, partition by kind.
+                api_tokens = [t for t in data if isinstance(t, dict) and t.get("kind") != "oauth"]
+                oauth_tokens = [t for t in data if isinstance(t, dict) and t.get("kind") == "oauth"]
             _bcl_logger.info(
-                "Found %d total tokens, %d OAuth tokens for %s",
-                len(tokens), len(oauth_tokens), username,
+                "Found %d api_tokens (preserved), %d oauth_tokens (to delete) for %s",
+                len(api_tokens), len(oauth_tokens), username,
             )
 
             for token in oauth_tokens:
@@ -579,7 +635,6 @@ notebook_dir = "/home/jovyan/work"
 c.DockerSpawner.notebook_dir = notebook_dir
 c.DockerSpawner.volumes = {"jhub-user-{username}": notebook_dir}
 singleuser_env = dotenv_values("/srv/env/.env.singleuserr")
-print(singleuser_env)
 c.DockerSpawner.environment = dict(singleuser_env)
 c.DockerSpawner.network_name = os.environ.get("DOCKER_NETWORK_NAME", "nginxproxy_energyguard_net")
 c.DockerSpawner.use_internal_ip = True
