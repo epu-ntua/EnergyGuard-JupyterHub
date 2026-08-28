@@ -658,7 +658,7 @@ c.JupyterHub.hub_connect_ip = "jupyterhub"
 # below can create the per-user directories on the host filesystem.
 
 _JHUB_DATA_HOST = os.environ.get(
-    "JUPYTERHUB_DATA_HOST_PATH", "/home/energyguard/jupyterhub_data"
+    "JUPYTERHUB_DATA_HOST_PATH", "/mnt/datadisk/volumes/jupyterhub_data"
 )
 _JHUB_DATA_CONTAINER = "/jupyterhub_data"  # as mounted in this JupyterHub container
 

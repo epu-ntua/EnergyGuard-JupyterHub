@@ -2,7 +2,11 @@ FROM jupyter/base-notebook:latest
 
 USER root
 
-RUN pip install --no-cache-dir \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends zip && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --timeout 120 --retries 10 \
     jupyterhub==4.1.6 \
     mlflow==3.8.1 \
     minio==7.2.20 \
