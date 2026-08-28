@@ -33,7 +33,15 @@ The Hub uses **DockerSpawner** to create isolated Docker containers for each use
         │  User A    │ │  User B   │ │  User C   │
         │(JupyterLab)│ │           │ │           │
         │            │ │           │ │           │
-        └────────────┘ └───────────┘ └───────────┘
+        └─────┬──────┘ └─────┬─────┘ └─────┬─────┘
+              │              │             │
+              └──────────────┼─────────────┘
+                             │  read-only bind-mount
+                    ┌────────▼─────────────────┐
+                    │  pilot_datasets/         │
+                    │  ONE shared copy on disk │
+                    │  (nightly export by DMS) │
+                    └──────────────────────────┘
 ```
 
 ---
@@ -138,21 +146,42 @@ with mlflow.start_run():
 
 ## Datasets and Notebooks Volumes
 
-Each user gets two dedicated directories that are bind-mounted into their container:
+Each user gets three dedicated directories bind-mounted into their container,
+plus one directory shared by **all** users:
 
-| Mount | Container Path | Mode |
-|-------|---------------|------|
-| **Datasets** | `/home/jovyan/work/datasets` | **Read-only** |
-| **Notebooks** | `/home/jovyan/work/notebooks` | **Read-write** |
+| Mount | Host Path | Container Path | Mode |
+|-------|-----------|---------------|------|
+| **Datasets** | `{data}/datasets/{username}` | `/home/jovyan/work/datasets` | **Read-only** |
+| **Notebooks** | `{data}/notebooks/{username}` | `/home/jovyan/work/notebooks` | **Read-write** |
+| **Auth** | `{data}/auth/{username}` | `/srv/eg-auth` | **Read-write** |
+| **Pilot datasets** | `{data}/pilot_datasets` | `/home/jovyan/.pilot` | **Read-only**, shared |
+
+`{data}` is the host shared directory (`JUPYTERHUB_DATA_HOST_PATH`, default
+`/mnt/datadisk/volumes/jupyterhub_data`), also mounted into the Hub container
+itself as `/jupyterhub_data` so the pre-spawn hook can create these paths.
+
+Two optional Hub environment variables control the pilot mount. Both default to
+the values the Data Management Server uses, so neither normally needs setting —
+but if you change one, change it in **both** services or the provisioned
+symlinks will point at a path that isn't mounted:
+
+| Variable | Default | Must match in DMS |
+|----------|---------|-------------------|
+| `PILOT_DATASETS_PREFIX` | `pilot_datasets` | `PILOT_DATASETS_PREFIX` |
+| `PILOT_MOUNT_PATH` | `/home/jovyan/.pilot` | `PILOT_MOUNT_PATH` |
 
 ### Provisioning
 
 A **pre-spawn hook** in `jupyterhub_config.py` runs before each user container starts:
 
-1. Creates the user's `datasets/` and `notebooks/` directories on the host if they don't exist
-2. Sets appropriate permissions
-3. Adds the bind-mount entries to the spawner configuration
+1. Creates the user's `datasets/`, `notebooks/` and `auth/` directories on the host if they don't exist
+2. Creates the shared `pilot_datasets/` directory if it doesn't exist, so Docker never invents a root-owned one
+3. Sets appropriate permissions
+4. Adds the bind-mount entries to the spawner configuration
 
+Because `spawner.volumes` is evaluated **per spawn**, a user with a server
+already running keeps their old mount list. After changing the hook, existing
+users must stop and start their server once to pick up the new mounts.
 
 ### Data Flow
 
@@ -160,7 +189,44 @@ Datasets and notebooks are populated by the **Data Management Server** (a separa
 
 - **Datasets** are read-only to prevent accidental modification of shared data.
 - **Notebooks** are read-write so users can edit and save their work.
+- **Auth** holds the per-user MLflow OIDC token cache written by the SDK.
 - Each user also has a personal persistent volume (`jhub-user-{username}`) mounted at `/home/jovyan/work/` for any other files they create.
+
+### Pilot datasets
+
+Pilot data (the seven partner datasets: `RDN CEDER BER CEA CARTIF REA ENGREEN`)
+is platform-owned and byte-identical for every user, so there is **one copy on
+disk**, not one per user. CEDER alone is ~127M rows — copying it per user would
+cost several GB every time somebody adds the dataset.
+
+The Data Management Server exports each partner nightly from the CARTIF data
+lake to `{data}/pilot_datasets/{PARTNER}/{PARTNER}.csv.gz`. That directory is
+mounted **read-only** at `/home/jovyan/.pilot` in every singleuser container —
+this mount is a prerequisite for the DMS's `POST /api/v1/provision/pilot`
+endpoint, which grants a user access by creating a symlink rather than a copy:
+
+```
+/home/jovyan/work/datasets/{dataset_name}  ->  /home/jovyan/.pilot/{PARTNER}
+```
+
+Two consequences worth knowing:
+
+- The DMS creates that symlink on the **host**, under the user's already-mounted
+  datasets directory, so it appears in an **already running** server with no
+  restart — Jupyter caches no filesystem state. (The one-time exception is the
+  server restart needed to get the `.pilot` mount itself.)
+- The link target is a *container-side* path, so on the host the symlink looks
+  dangling. That is expected; it resolves correctly inside the container.
+
+The mount deliberately sits outside `notebook_dir` (`/home/jovyan/work`), so the
+raw partner directories don't clutter the file browser — users only see the
+datasets they asked for, under the names they chose.
+
+In a notebook, nothing special is needed:
+
+```python
+pd.read_csv('datasets/REA Pilot Data/REA.csv.gz')
+```
 
 ---
 
@@ -193,10 +259,23 @@ docker compose up -d
 docker build -t energyguard-singleuser:latest -f Dockerfile.singleuser .
 ```
 
+`jupyterhub_config.py` is bind-mounted read-only over the copy baked into the
+image (see `docker-compose.yml`), so **config changes need only a restart**, not
+a rebuild:
+
+```bash
+docker compose restart jupyterhub
+```
+
+Changing the pre-spawn hook does **not** require rebuilding the singleuser
+image — mounts are injected at spawn time via the Docker API. Users with a
+server already running must stop and start it once to pick up new mounts.
+
 Ensure the following are in place:
 1. `.env` — Hub configuration (Keycloak credentials, crypt key, etc.)
 3. The Docker network `nginxproxy_energyguard_net` exists
 4. Keycloak is configured with a `jupyterhub` client in the `EnergyGuard` realm
+5. The shared data directory exists with `datasets/`, `notebooks/`, `auth/` and `pilot_datasets/` subdirectories
 
 ---
 
