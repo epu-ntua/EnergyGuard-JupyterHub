@@ -652,15 +652,30 @@ c.JupyterHub.hub_connect_ip = "jupyterhub"
 # directory on the host: /home/energyguard/jupyterhub_data/
 #   datasets/{username}/{dataset_name}/  →  mounted read-only  at /home/jovyan/work/datasets
 #   notebooks/{username}/               →  mounted read-write at /home/jovyan/work/notebooks
+#   pilot_datasets/{PARTNER}/           →  mounted read-only  at /home/jovyan/.pilot
 #
 # The JupyterHub container itself has /home/energyguard/jupyterhub_data
 # bind-mounted as /jupyterhub_data (see docker-compose.yml), so the hook
 # below can create the per-user directories on the host filesystem.
+#
+# Pilot datasets are platform-owned and byte-identical for every user, so they
+# are NOT copied per user — there is one copy on disk, mounted read-only into
+# every server, and the DMS provisions a symlink
+#     work/datasets/<dataset_name> -> /home/jovyan/.pilot/<PARTNER>
+# per user. Copying instead would multiply CEDER (~500 MB gzipped, several GB
+# raw) by the number of users. The mount lives outside notebook_dir so the raw
+# partner directories do not clutter the file browser; users reach them through
+# the symlinks they asked for.
 
 _JHUB_DATA_HOST = os.environ.get(
     "JUPYTERHUB_DATA_HOST_PATH", "/mnt/datadisk/volumes/jupyterhub_data"
 )
 _JHUB_DATA_CONTAINER = "/jupyterhub_data"  # as mounted in this JupyterHub container
+
+# Must match PILOT_DATASETS_PREFIX / PILOT_MOUNT_PATH in the DMS .env — the DMS
+# writes the exports here and points its symlinks at the mount path.
+_PILOT_DIR_NAME = os.environ.get("PILOT_DATASETS_PREFIX", "pilot_datasets")
+_PILOT_MOUNT_PATH = os.environ.get("PILOT_MOUNT_PATH", "/home/jovyan/.pilot")
 
 DATASET_DIR_MODE = 0o755
 NOTEBOOK_DIR_MODE = 0o777
@@ -686,13 +701,24 @@ async def pre_spawn_hook(spawner):
     os.chmod(notebooks_container_path, NOTEBOOK_DIR_MODE)
     os.chmod(auth_container_path, AUTH_DIR_MODE)
 
+    # Shared, single-copy pilot data. Created here too so the bind-mount below
+    # never causes Docker to invent a root-owned directory on the host when the
+    # nightly export has not run yet.
+    pilot_container_path = Path(_JHUB_DATA_CONTAINER) / _PILOT_DIR_NAME
+    pilot_container_path.mkdir(parents=True, exist_ok=True)
+    os.chmod(pilot_container_path, DATASET_DIR_MODE)
+
     # Tell DockerSpawner to bind-mount the host paths into the singleuser container.
     datasets_host = f"{_JHUB_DATA_HOST}/datasets/{username}"
     notebooks_host = f"{_JHUB_DATA_HOST}/notebooks/{username}"
     auth_host = f"{_JHUB_DATA_HOST}/auth/{username}"
+    pilot_host = f"{_JHUB_DATA_HOST}/{_PILOT_DIR_NAME}"
     spawner.volumes[datasets_host] = {"bind": "/home/jovyan/work/datasets", "mode": "ro"}
     spawner.volumes[notebooks_host] = {"bind": "/home/jovyan/work/notebooks", "mode": "rw"}
     spawner.volumes[auth_host] = {"bind": "/srv/eg-auth", "mode": "rw"}
+    # Read-only: pilot data is reference data, and every user shares this one
+    # copy. "ro" is what makes the provisioned symlinks non-writable.
+    spawner.volumes[pilot_host] = {"bind": _PILOT_MOUNT_PATH, "mode": "ro"}
 
 
 c.Spawner.pre_spawn_hook = pre_spawn_hook
