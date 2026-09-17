@@ -13,9 +13,9 @@ RUN pip install --no-cache-dir --timeout 120 --retries 10 \
     boto3==1.42.34 \
     python-dotenv==1.2.1 \
     pyarrow==22.0.0 \
-    torch==2.10.0 \
+    torch==2.9.1 \
     pandas==2.3.3 \
-    numpy==2.4.1 \
+    numpy==2.3.1 \
     matplotlib==3.10.8 \
     scikit-learn==1.8.0 \
     tqdm==4.67.1\

@@ -84,9 +84,9 @@ A custom IPython kernel named **`eg-default`** is installed system-wide and set 
 | Package | Version | 
 |---------|---------|
 | `mlflow` | 3.8.1 | 
-| `torch` | 2.10.0 | 
+| `torch` | 2.9.1 | 
 | `pandas` | 2.3.3 | 
-| `numpy` | 2.4.1 | 
+| `numpy` | 2.3.1 | 
 | `scikit-learn` | 1.8.0 | 
 | `matplotlib` | 3.10.8 | 
 | `pyarrow` | 22.0.0 | 
