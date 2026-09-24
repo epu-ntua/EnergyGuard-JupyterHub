@@ -43,8 +43,8 @@ The Hub uses **DockerSpawner** to start an isolated Docker container for each us
                                          │ read-only, shared
                            ┌─────────────▼────────────┐
                            │     pilot_datasets/      │
-                           │ ONE shared copy on disk  │
-                           │ (nightly export by DMS)  │
+                           │ one shared copy on disk  │
+                           │ (nightly export by DPS)  │
                            └──────────────────────────┘
 ```
 
@@ -54,7 +54,7 @@ Each singleuser container gets its own `work/` volume and its own `datasets/`, `
 
 ## Hub Container
 
-The Hub image (`Dockerfile`) is built on `python:3.11-slim` and installs JupyterHub 4, DockerSpawner 13, OAuthenticator and `configurable-http-proxy`. It listens on port **8009** for the Hub and on port **8002** for Keycloak backchannel logout.
+The Hub image (`Dockerfile`) is built on `python:3.11-slim` and installs JupyterHub 4, DockerSpawner 13, OAuthenticator and `configurable-http-proxy`.
 
 ### Authentication (Keycloak OIDC)
 
@@ -79,7 +79,7 @@ The scopes `self`, `users:activity!user` and `access:servers!server` are Jupyter
 
 Logging out of JupyterHub sends the browser to the Keycloak end session endpoint. This signs the user out of Keycloak and then returns them to the JupyterHub login page.
 
-Logging out of any other EnergyGuard service also ends the JupyterHub session. Keycloak sends a backchannel logout request to a small HTTP server that the Hub runs on port **8002**. When it receives one, the Hub
+Logging out of other EnergyGuard services also ends the JupyterHub session. Keycloak sends a backchannel logout request to a small HTTP server that the Hub runs. When it receives one, the Hub
 
 1. adds the user to a revocation list (`/srv/jupyterhub/revoked_users.json`), where they stay for 5 minutes,
 2. deletes the user's browser OAuth tokens through the JupyterHub API, so the notebook tab is logged out while the server itself keeps running,
@@ -87,9 +87,8 @@ Logging out of any other EnergyGuard service also ends the JupyterHub session. K
 
 Logging in to Keycloak again after the revocation clears it. Singleuser servers cache Hub tokens for 30 seconds, so a logout reaches the notebook within about that time.
 
-Deleting tokens through the API requires `BCL_API_TOKEN` in `.env`. Without it the revocation still works, but the notebook tab stays logged in until its token expires.
+Deleting tokens through the API requires `BCL_API_TOKEN` in `.env`.
 
-After login, the Hub never redirects a user to a URL that belongs to another user's server. It sends them to their own server instead. This prevents a login loop when a browser still has the previous user's notebook URL open.
 
 ### Hub environment variables (`.env`)
 
@@ -175,9 +174,6 @@ The SDK keeps an MLflow PAT in `/srv/eg-auth/mlflow_token.json`. This directory 
 * If it has less than 60 days left, the SDK tries to get a new one and keeps the old one if that fails.
 * If there is no token or it has expired, the SDK gets a new one.
 
-To get a new PAT, the SDK takes the user's Keycloak token from the Hub and calls `PATCH /api/2.0/mlflow/users/access-token` on MLflow. The new token is valid for 300 days and is saved with mode `0600`. A file lock stops two kernels from requesting a token at the same time. The SDK then sets `MLFLOW_TRACKING_USERNAME` and `MLFLOW_TRACKING_PASSWORD`, and MLflow uses basic authentication.
-
-Getting a new PAT fails if the user has never logged in to the MLflow web UI, because mlflow-oidc-auth has no account for them yet.
 
 #### 2. Bearer token fallback
 
@@ -218,7 +214,7 @@ Each user gets three personal directories bind mounted into their container, plu
 
 `{data}` is the shared host directory set by `JUPYTERHUB_DATA_HOST_PATH` (default `/mnt/datadisk/volumes/jupyterhub_data`). It is also mounted into the Hub container at `/jupyterhub_data`, so the pre spawn hook can create these paths.
 
-`PILOT_DATASETS_PREFIX` and `PILOT_MOUNT_PATH` default to the same values as in the Data Management Server (DMS). If you change one of them, change it in **both** services. Otherwise the DMS will create symlinks to a path that is not mounted.
+`PILOT_DATASETS_PREFIX` and `PILOT_MOUNT_PATH` default to the same values as in the [Data Provisioning Server](https://github.com/EnergyGuardProject/data_managment_server) (DPS). 
 
 ### Provisioning
 
@@ -233,7 +229,7 @@ Mounts are added each time a server starts. A user whose server is already runni
 
 ### Data Flow
 
-The **Data Management Server** (a separate FastAPI service) fills the datasets and notebooks directories by downloading files from MinIO. When a user's container starts, the files are already in `/home/jovyan/work/datasets/` and `/home/jovyan/work/notebooks/`.
+The **Data Provisioning Server** (a separate FastAPI service) fills the datasets and notebooks directories by downloading files from MinIO. When a user's container starts, the files are already in `/home/jovyan/work/datasets/` and `/home/jovyan/work/notebooks/`.
 
 * **Datasets** are read-only, so users cannot modify their data by accident.
 * **Notebooks** are read-write, so users can edit and save their work.
@@ -244,13 +240,13 @@ The **Data Management Server** (a separate FastAPI service) fills the datasets a
 
 The pilot data consists of the seven partner datasets (`RDN`, `CEDER`, `BER`, `CEA`, `CARTIF`, `REA`, `ENGREEN`). It is the same for every user, so there is **one copy on disk** for everyone. CEDER alone has about 127M rows.
 
-Every night the DMS exports each partner from the CARTIF data lake to `{data}/pilot_datasets/{PARTNER}/{PARTNER}.csv.gz`. This directory is mounted **read-only** at `/home/jovyan/.pilot` in every singleuser container. The DMS endpoint `POST /api/v1/provision/pilot` needs this mount. It gives a user access by creating a symlink in their datasets directory.
+Every night the DPS exports each partner from the CARTIF data lake to `{data}/pilot_datasets/{PARTNER}/{PARTNER}.csv.gz`. This directory is mounted **read-only** at `/home/jovyan/.pilot` in every singleuser container. The DPS endpoint `POST /api/v1/provision/pilot` needs this mount. It gives a user access by creating a symlink in their datasets directory.
 
 ```
 /home/jovyan/work/datasets/{dataset_name}  ->  /home/jovyan/.pilot/{PARTNER}
 ```
 
-The DMS creates the symlink on the host, inside the user's datasets directory. It appears in a running server immediately, with no restart. A restart is only needed once, for a server that was started before the `.pilot` mount existed.
+The DPS creates the symlink on the host, inside the user's datasets directory. It appears in a running server immediately, with no restart. A restart is only needed once, for a server that was started before the `.pilot` mount existed.
 
 The symlink points to a path inside the container, so on the host it looks broken. This is expected. It works inside the container.
 
