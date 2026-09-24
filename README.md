@@ -1,17 +1,17 @@
 # EnergyGuard JupyterHub Deployment
 
-This document describes how JupyterHub is deployed in the EnergyGuard platform (ICCS premises) for constant access without GPU resources.
+This document describes how JupyterHub is deployed in the EnergyGuard platform (ICCS premises). It gives users constant access to notebooks without GPU resources.
 
 ---
 
 ## Architecture Overview
 
-JupyterHub runs as a **Docker-based deployment** with two main container images:
+JupyterHub runs as a **Docker based deployment** with two container images.
 
-1. **Hub container** — the central JupyterHub process that handles authentication, user management, and spawning individual notebook servers.
-2. **Singleuser containers** — one per user, each running a full JupyterLab environment with a pre-configured Python kernel and all necessary packages.
+1. **Hub container.** The central JupyterHub process. It handles authentication, user management and the spawning of notebook servers.
+2. **Singleuser containers.** One per user, each running a full JupyterLab environment with a preconfigured Python kernel and the packages listed below.
 
-The Hub uses **DockerSpawner** to create isolated Docker containers for each user on demand. All containers communicate over a shared Docker network (`nginxproxy_energyguard_net`) behind an Nginx reverse proxy.
+The Hub uses **DockerSpawner** to start an isolated Docker container for each user on demand. All containers share the Docker network `nginxproxy_energyguard_net` and sit behind an Nginx reverse proxy.
 
 ```
                     ┌─────────────────┐
@@ -48,89 +48,143 @@ The Hub uses **DockerSpawner** to create isolated Docker containers for each use
 
 ## Hub Container
 
+The Hub image (`Dockerfile`) is built on `python:3.11-slim` and installs JupyterHub 4, DockerSpawner 13, OAuthenticator and `configurable-http-proxy`. It listens on port **8009** for the Hub and on port **8002** for Keycloak backchannel logout.
+
 ### Authentication (Keycloak OIDC)
 
-Users authenticate via **Keycloak** using the OpenID Connect protocol. The Hub is registered as a Keycloak client in the `EnergyGuard` realm.
+Users log in through **Keycloak** with OpenID Connect. The Hub is registered as the `jupyterhub` client in the `EnergyGuard` realm, and its callback URL is `https://jupyterhub.energy-guard.eu/hub/oauth_callback`. Every user who can log in to Keycloak is allowed in, and the JupyterHub username is the Keycloak `preferred_username`.
 
-Key aspects:
-- **Auth state persistence:** Enabled (`enable_auth_state = True`). The user's Keycloak access token is stored in JupyterHub's auth state and made available to singleuser containers. This is critical for the MLflow SSO integration described below.
-<!-- - **Logout:** Configured to perform Keycloak front-channel logout so users are signed out of all connected services. -->
+Auth state is enabled (`enable_auth_state = True`). The Hub stores the user's Keycloak access token in its auth state, and the singleuser containers can read it. The MLflow integration described below depends on this.
 
-Custom roles grant singleuser servers permission to read the spawning user's auth state (and only of that user)
+The Hub checks each user's session with Keycloak every 30 seconds (`auth_refresh_age = 30`) and again before every spawn.
 
-- **`user` role** — scopes: `self`, `admin:auth_state!user`
-- **`server` role** — scopes: `users:activity!user`, `access:servers!server`, `admin:auth_state!user`
+### Roles and scopes
 
-Most of these scopes (`self`, `users:activity!user`, `access:servers!server`) are JupyterHub defaults:
+Two custom roles let a singleuser server read the auth state of the user who owns it, and no one else's.
 
-The addition to both roles is `admin:auth_state!user`, which allows the singleuser container to call the Hub's `/hub/api/users/{username}/auth-state` endpoint and retrieve the user's stored Keycloak access token. The `!user` suffix is a JupyterHub scope filter that restricts access to the auth state of that specific user only — a singleuser server cannot read another user's token.
+| Role | Scopes |
+|------|--------|
+| `user` | `self`, `admin:auth_state!user` |
+| `server` | `users:activity!user`, `access:servers!server`, `admin:auth_state!user` |
 
-This allows the energyguard-sdk running inside each container to fetch the user's Keycloak token from the Hub API so the energyguard-sdk can perform MLflow calls
+The scopes `self`, `users:activity!user` and `access:servers!server` are JupyterHub defaults. Both roles add `admin:auth_state!user`, which lets the singleuser container call `/hub/api/users/{username}?include_auth_state=1` and get the user's stored Keycloak access token. The `!user` filter limits this to the owner's own auth state, so one user's server cannot read another user's token.
+
+### Logout
+
+Logging out of JupyterHub sends the browser to the Keycloak end session endpoint. This signs the user out of Keycloak and then returns them to the JupyterHub login page.
+
+Logging out of any other EnergyGuard service also ends the JupyterHub session. Keycloak sends a backchannel logout request to a small HTTP server that the Hub runs on port **8002**. When it receives one, the Hub
+
+1. adds the user to a revocation list (`/srv/jupyterhub/revoked_users.json`), where they stay for 5 minutes,
+2. deletes the user's browser OAuth tokens through the JupyterHub API, so the notebook tab is logged out while the server itself keeps running,
+3. rejects the user's session on their next Hub request and invalidates any old login cookie in the browser.
+
+Logging in to Keycloak again after the revocation clears it. Singleuser servers cache Hub tokens for 30 seconds, so a logout reaches the notebook within about that time.
+
+Deleting tokens through the API requires `BCL_API_TOKEN` in `.env`. Without it the revocation still works, but the notebook tab stays logged in until its token expires.
+
+After login, the Hub never redirects a user to a URL that belongs to another user's server. It sends them to their own server instead. This prevents a login loop when a browser still has the previous user's notebook URL open.
+
+### Hub environment variables (`.env`)
+
+| Variable | Description |
+|----------|-------------|
+| `KC_REALM` | Keycloak realm (default `EnergyGuard`) |
+| `KC_BASE_URL` | Public Keycloak base URL |
+| `KC_CLIENT_ID` | Keycloak client ID (`jupyterhub`) |
+| `KC_CLIENT_SECRET` | Keycloak client secret |
+| `JUPYTERHUB_CRYPT_KEY` | Key that encrypts the stored auth state |
+| `DOCKER_NOTEBOOK_IMAGE` | Singleuser image (`energyguard-singleuser:latest`) |
+| `DOCKER_NETWORK_NAME` | Shared Docker network (default `nginxproxy_energyguard_net`) |
+| `JH_COOKIE_SECURE` | Set the Secure flag on Hub cookies (default `true`) |
+| `BCL_API_TOKEN` | API token for the backchannel logout service (optional) |
+| `BCL_PORT` | Port of the backchannel logout server (default `8002`) |
+| `JUPYTERHUB_DATA_HOST_PATH` | Host path of the shared data directory (default `/mnt/datadisk/volumes/jupyterhub_data`) |
+| `PILOT_DATASETS_PREFIX` | Name of the pilot data directory (default `pilot_datasets`) |
+| `PILOT_MOUNT_PATH` | Container path of the pilot data mount (default `/home/jovyan/.pilot`) |
 
 ---
 
 ## Singleuser Container (Custom Kernel)
 
-**Dockerfile:** `Dockerfile.singleuser`
+The singleuser image (`Dockerfile.singleuser`) is spawned for each user. It is built on `jupyter/base-notebook:latest`.
 
-Built on `jupyter/base-notebook:latest`, this is the image spawned for each user.
+### Default kernel `eg-default` (EnergyGuard Python)
 
-### Default Kernel: `eg-default` (EnergyGuard Python)
-
-A custom IPython kernel named **`eg-default`** is installed system-wide and set as the **default kernel** for all new notebooks (via `jupyter_server_config.py`).
+A custom IPython kernel named **`eg-default`**, shown as "EnergyGuard (Python)", is installed system wide. It is the **default kernel** for all new notebooks (set in `/etc/jupyter/jupyter_server_config.py`).
 
 ### Installed Packages
 
-| Package | Version | 
+| Package | Version |
 |---------|---------|
-| `mlflow` | 3.8.1 | 
-| `torch` | 2.9.1 | 
-| `pandas` | 2.3.3 | 
-| `numpy` | 2.3.1 | 
-| `scikit-learn` | 1.8.0 | 
-| `matplotlib` | 3.10.8 | 
-| `pyarrow` | 22.0.0 | 
-| `boto3` | 1.42.34 | 
-| `minio` | 7.2.20 | 
+| `jupyterhub` | 4.1.6 |
+| `mlflow` | 3.8.1 |
+| `torch` | 2.9.1 |
+| `pytorch_lightning` | 2.6.1 |
+| `pandas` | 2.3.3 |
+| `numpy` | 2.3.1 |
+| `scikit-learn` | 1.8.0 |
+| `matplotlib` | 3.10.8 |
+| `pyarrow` | 22.0.0 |
+| `boto3` | 1.42.34 |
+| `minio` | 7.2.20 |
 | `requests` | 2.32.5 |
-| `python-dotenv` | 1.2.1 | 
-| `tqdm` | 4.67.1 | 
+| `python-dotenv` | 1.2.1 |
+| `tqdm` | 4.67.1 |
 
-Additionally, the **energyguard-sdk** is installed (see below).
+The image also includes the `zip` command line tool and the **energyguard-sdk** (see below).
 
 ### Environment Variables
 
-The singleuser containers use the following environment variables:
+These are set in `Dockerfile.singleuser`.
 
-| Variable | Description |
-|----------|-------------|
-| `MLFLOW_TRACKING_URI` | URL of the MLflow server |
-| `MLFLOW_S3_ENDPOINT_URL` | MinIO S3 endpoint for artifact storage |
-| `EG_MLFLOW_SSO_AUTO` | Enable automatic MLflow SSO (set to `0` or`1`) |
-| `EG_MLFLOW_SSO_DEBUG` | Enable SDK debug logging (set to `0` or `1`) |
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `MLFLOW_TRACKING_URI` | `https://mlflow.energy-guard.eu/` | URL of the MLflow server |
+| `MLFLOW_S3_ENDPOINT_URL` | `https://minio-backend.energy-guard.eu/` | MinIO S3 endpoint for artifact storage |
+| `EG_MLFLOW_SSO_AUTO` | `1` | Enable the Bearer token fallback (`0` or `1`) |
+| `EG_MLFLOW_SSO_DEBUG` | `0` | Enable SDK debug logging (`0` or `1`) |
+
+The SDK also reads `EG_MLFLOW_TOKEN_DIR`, the directory of the MLflow token file. It is not set in the image, so the SDK uses `/srv/eg-auth`.
 
 ---
 
 ## EnergyGuard SDK
 
-**Location:** `energyguard-sdk/`
+The SDK lives in `energyguard-sdk/`.
 
-The energyguard-sdk solves the following problem: **MLflow is protected behind Keycloak authentication**, but the MLflow Python client does not natively support OIDC. The SDK transparently injects the user's Keycloak access token into all HTTP requests made to MLflow, so that calls like `mlflow.log_metric()` or `mlflow.start_run()` work without any manual authentication.
+MLflow is protected by Keycloak through mlflow-oidc-auth, and the MLflow Python client cannot log in with OIDC by itself. The energyguard-sdk logs users in to MLflow automatically, so calls like `mlflow.start_run()` or `mlflow.log_metric()` work with no authentication code.
 
+### How it works
 
-### Key Components
+`sitecustomize.py` runs every time Python starts. It first tries to set up a **personal access token (PAT)**. If that fails, it installs a **Bearer token patch** for `requests`.
 
-1. **`sitecustomize.py`** — Runs automatically when Python starts. Calls `auto_install()` which checks if the environment is a JupyterHub singleuser container (by looking for `JUPYTERHUB_API_URL`, `JUPYTERHUB_API_TOKEN`, etc.) and if so, patches the `requests` library.
+#### 1. Personal access token
 
-2. **`mlflow_sso/sso.py`** — Core implementation:
-   - **`get_access_token()`** — Fetches the user's Keycloak token from JupyterHub's auth state API. Tokens are cached in memory and automatically refreshed before expiration.
-   - **`install_requests_patch()`** — Patches `requests.Session.request()` to intercept requests to the MLflow host and inject the Bearer token.
-   - **Retry logic** — On 401, 403, or 500 responses (or if a Keycloak login page HTML is detected instead of JSON), the SDK forces a token refresh and retries the request once.
-   - **Thread-safe** — Token acquisition uses a lock to prevent concurrent refresh races.
+This is handled by `ensure_pat()` in `mlflow_sso/token_manager.py`.
+
+The SDK keeps an MLflow PAT in `/srv/eg-auth/mlflow_token.json`. This directory is bind mounted from the host, so the token survives when the container is removed.
+
+* If the stored token has more than 60 days left, the SDK uses it with no network call.
+* If it has less than 60 days left, the SDK tries to get a new one and keeps the old one if that fails.
+* If there is no token or it has expired, the SDK gets a new one.
+
+To get a new PAT, the SDK takes the user's Keycloak token from the Hub and calls `PATCH /api/2.0/mlflow/users/access-token` on MLflow. The new token is valid for 300 days and is saved with mode `0600`. A file lock stops two kernels from requesting a token at the same time. The SDK then sets `MLFLOW_TRACKING_USERNAME` and `MLFLOW_TRACKING_PASSWORD`, and MLflow uses basic authentication.
+
+Getting a new PAT fails if the user has never logged in to the MLflow web UI, because mlflow-oidc-auth has no account for them yet.
+
+#### 2. Bearer token fallback
+
+This is handled by `auto_install()` in `mlflow_sso/sso.py`. It runs only when no PAT is available, `EG_MLFLOW_SSO_AUTO=1`, `MLFLOW_TRACKING_URI` is set and the JupyterHub variables (`JUPYTERHUB_API_URL`, `JUPYTERHUB_API_TOKEN`, `JUPYTERHUB_USER`) are present. It patches `requests.Session.request`.
+
+* `get_access_token()` reads the user's Keycloak token from the Hub API and caches it in memory. It fetches it again when it is less than 60 seconds from expiry.
+* Every request to the MLflow host gets an `Authorization: Bearer` header with this token.
+* On a 401, 403 or 500 response, or when Keycloak returns its HTML login page, the SDK fetches the token again and retries once. If it still gets the login page, it raises a `RuntimeError` that explains the problem.
+* A lock prevents concurrent token refreshes.
 
 ### From the User's Perspective
 
-Users write standard MLflow code with no extra authentication code required:
+Users write standard MLflow code with no authentication code.
 
 ```python
 import mlflow
@@ -139,15 +193,15 @@ mlflow.set_experiment("my-experiment")
 with mlflow.start_run():
     mlflow.log_param("lr", 0.01)
     mlflow.log_metric("accuracy", 0.95)
-    # Everything just works — auth is handled automatically
 ```
+
+Users should log in to the MLflow web UI once before their first MLflow call from a notebook. Setting `EG_MLFLOW_SSO_DEBUG=1` prints the SDK's debug messages to stderr.
 
 ---
 
 ## Datasets and Notebooks Volumes
 
-Each user gets three dedicated directories bind-mounted into their container,
-plus one directory shared by **all** users:
+Each user gets three personal directories bind mounted into their container, plus one directory shared by **all** users.
 
 | Mount | Host Path | Container Path | Mode |
 |-------|-----------|---------------|------|
@@ -156,73 +210,47 @@ plus one directory shared by **all** users:
 | **Auth** | `{data}/auth/{username}` | `/srv/eg-auth` | **Read-write** |
 | **Pilot datasets** | `{data}/pilot_datasets` | `/home/jovyan/.pilot` | **Read-only**, shared |
 
-`{data}` is the host shared directory (`JUPYTERHUB_DATA_HOST_PATH`, default
-`/mnt/datadisk/volumes/jupyterhub_data`), also mounted into the Hub container
-itself as `/jupyterhub_data` so the pre-spawn hook can create these paths.
+`{data}` is the shared host directory set by `JUPYTERHUB_DATA_HOST_PATH` (default `/mnt/datadisk/volumes/jupyterhub_data`). It is also mounted into the Hub container at `/jupyterhub_data`, so the pre spawn hook can create these paths.
 
-Two optional Hub environment variables control the pilot mount. Both default to
-the values the Data Management Server uses, so neither normally needs setting —
-but if you change one, change it in **both** services or the provisioned
-symlinks will point at a path that isn't mounted:
-
-| Variable | Default | Must match in DMS |
-|----------|---------|-------------------|
-| `PILOT_DATASETS_PREFIX` | `pilot_datasets` | `PILOT_DATASETS_PREFIX` |
-| `PILOT_MOUNT_PATH` | `/home/jovyan/.pilot` | `PILOT_MOUNT_PATH` |
+`PILOT_DATASETS_PREFIX` and `PILOT_MOUNT_PATH` default to the same values as in the Data Management Server (DMS). If you change one of them, change it in **both** services. Otherwise the DMS will create symlinks to a path that is not mounted.
 
 ### Provisioning
 
-A **pre-spawn hook** in `jupyterhub_config.py` runs before each user container starts:
+A **pre spawn hook** in `jupyterhub_config.py` runs before each user container starts. It
 
-1. Creates the user's `datasets/`, `notebooks/` and `auth/` directories on the host if they don't exist
-2. Creates the shared `pilot_datasets/` directory if it doesn't exist, so Docker never invents a root-owned one
-3. Sets appropriate permissions
-4. Adds the bind-mount entries to the spawner configuration
+1. creates the user's `datasets/`, `notebooks/` and `auth/` directories on the host if they do not exist,
+2. creates the shared `pilot_datasets/` directory if it does not exist, so that Docker does not create it owned by root,
+3. sets the directory permissions,
+4. adds the bind mounts to the spawner configuration.
 
-Because `spawner.volumes` is evaluated **per spawn**, a user with a server
-already running keeps their old mount list. After changing the hook, existing
-users must stop and start their server once to pick up the new mounts.
+Mounts are added each time a server starts. A user whose server is already running keeps the old mounts until they stop and start it.
 
 ### Data Flow
 
-Datasets and notebooks are populated by the **Data Management Server** (a separate FastAPI service), which downloads files from MinIO into the host directories. When a user logs in and their container spawns, the files are already available at `/home/jovyan/work/datasets/` and `/home/jovyan/work/notebooks/`.
+The **Data Management Server** (a separate FastAPI service) fills the datasets and notebooks directories by downloading files from MinIO. When a user's container starts, the files are already in `/home/jovyan/work/datasets/` and `/home/jovyan/work/notebooks/`.
 
-- **Datasets** are read-only to prevent accidental modification of shared data.
-- **Notebooks** are read-write so users can edit and save their work.
-- **Auth** holds the per-user MLflow OIDC token cache written by the SDK.
-- Each user also has a personal persistent volume (`jhub-user-{username}`) mounted at `/home/jovyan/work/` for any other files they create.
+* **Datasets** are read-only, so users cannot modify their data by accident.
+* **Notebooks** are read-write, so users can edit and save their work.
+* **Auth** holds the user's MLflow token file written by the SDK.
+* Each user also has a personal Docker volume (`jhub-user-{username}`) mounted at `/home/jovyan/work/` for any other files they create.
 
 ### Pilot datasets
 
-Pilot data (the seven partner datasets: `RDN CEDER BER CEA CARTIF REA ENGREEN`)
-is platform-owned and byte-identical for every user, so there is **one copy on
-disk**, not one per user. CEDER alone is ~127M rows — copying it per user would
-cost several GB every time somebody adds the dataset.
+The pilot data consists of the seven partner datasets (`RDN`, `CEDER`, `BER`, `CEA`, `CARTIF`, `REA`, `ENGREEN`). It is the same for every user, so there is **one copy on disk** for everyone. CEDER alone has about 127M rows.
 
-The Data Management Server exports each partner nightly from the CARTIF data
-lake to `{data}/pilot_datasets/{PARTNER}/{PARTNER}.csv.gz`. That directory is
-mounted **read-only** at `/home/jovyan/.pilot` in every singleuser container —
-this mount is a prerequisite for the DMS's `POST /api/v1/provision/pilot`
-endpoint, which grants a user access by creating a symlink rather than a copy:
+Every night the DMS exports each partner from the CARTIF data lake to `{data}/pilot_datasets/{PARTNER}/{PARTNER}.csv.gz`. This directory is mounted **read-only** at `/home/jovyan/.pilot` in every singleuser container. The DMS endpoint `POST /api/v1/provision/pilot` needs this mount. It gives a user access by creating a symlink in their datasets directory.
 
 ```
 /home/jovyan/work/datasets/{dataset_name}  ->  /home/jovyan/.pilot/{PARTNER}
 ```
 
-Two consequences worth knowing:
+The DMS creates the symlink on the host, inside the user's datasets directory. It appears in a running server immediately, with no restart. A restart is only needed once, for a server that was started before the `.pilot` mount existed.
 
-- The DMS creates that symlink on the **host**, under the user's already-mounted
-  datasets directory, so it appears in an **already running** server with no
-  restart — Jupyter caches no filesystem state. (The one-time exception is the
-  server restart needed to get the `.pilot` mount itself.)
-- The link target is a *container-side* path, so on the host the symlink looks
-  dangling. That is expected; it resolves correctly inside the container.
+The symlink points to a path inside the container, so on the host it looks broken. This is expected. It works inside the container.
 
-The mount deliberately sits outside `notebook_dir` (`/home/jovyan/work`), so the
-raw partner directories don't clutter the file browser — users only see the
-datasets they asked for, under the names they chose.
+The `.pilot` mount is outside `/home/jovyan/work`, so users do not see the raw partner directories in the file browser. They only see the datasets they added, under the names they chose.
 
-In a notebook, nothing special is needed:
+In a notebook, read the data as usual.
 
 ```python
 pd.read_csv('datasets/REA Pilot Data/REA.csv.gz')
@@ -232,7 +260,7 @@ pd.read_csv('datasets/REA Pilot Data/REA.csv.gz')
 
 ## Networking
 
-All services (Hub, singleuser containers, Nginx proxy, MLflow, etc.) share the external Docker network `nginxproxy_energyguard_net`. The Hub's singleuser containers communicate with the Hub via Docker-internal DNS (`jupyterhub`), avoiding external routing.
+All services (Hub, singleuser containers, Nginx proxy, MLflow and others) share the external Docker network `nginxproxy_energyguard_net`. Singleuser containers reach the Hub through Docker's internal DNS name `jupyterhub`, and the Hub reaches them by their internal IP.
 
 ---
 
@@ -240,42 +268,42 @@ All services (Hub, singleuser containers, Nginx proxy, MLflow, etc.) share the e
 
 | Service | URL | Purpose |
 |---------|-----|---------|
+| **JupyterHub** | `https://jupyterhub.energy-guard.eu` | This deployment |
 | **Keycloak** | `https://keycloak.toolbox.epu.ntua.gr` | Identity provider (OIDC) |
 | **MLflow** | `https://mlflow.energy-guard.eu` | Experiment tracking |
-| **MinIO** | `https://minio-backend.energy-guard.eu` | S3-compatible object storage |
+| **MinIO** | `https://minio-backend.energy-guard.eu` | S3 compatible object storage |
 
 ---
 
 ## Quick Start
 
+Before starting, make sure that
+
+1. `.env` exists with the Hub configuration (copy `.env.example` and fill in the values),
+2. the Docker network `nginxproxy_energyguard_net` exists,
+3. Keycloak has a `jupyterhub` client in the `EnergyGuard` realm, with the Hub callback URL as a redirect URI and a backchannel logout URL that reaches port 8002 of the Hub,
+4. the shared data directory exists on the host.
+
+Build both images and start the Hub.
+
 ```bash
-# Build both images
+# Singleuser image
+docker build -t energyguard-singleuser:latest -f Dockerfile.singleuser .
+
+# Hub image
 docker compose build
 
 # Start the Hub
 docker compose up -d
-
-# The singleuser image (energyguard-singleuser:latest) must also be built:
-docker build -t energyguard-singleuser:latest -f Dockerfile.singleuser .
 ```
 
-`jupyterhub_config.py` is bind-mounted read-only over the copy baked into the
-image (see `docker-compose.yml`), so **config changes need only a restart**, not
-a rebuild:
+`jupyterhub_config.py` is mounted read-only over the copy inside the image (see `docker-compose.yml`), so after a config change you only need to restart the Hub.
 
 ```bash
 docker compose restart jupyterhub
 ```
 
-Changing the pre-spawn hook does **not** require rebuilding the singleuser
-image — mounts are injected at spawn time via the Docker API. Users with a
-server already running must stop and start it once to pick up new mounts.
-
-Ensure the following are in place:
-1. `.env` — Hub configuration (Keycloak credentials, crypt key, etc.)
-3. The Docker network `nginxproxy_energyguard_net` exists
-4. Keycloak is configured with a `jupyterhub` client in the `EnergyGuard` realm
-5. The shared data directory exists with `datasets/`, `notebooks/`, `auth/` and `pilot_datasets/` subdirectories
+Changes to the pre spawn hook do not need a rebuild of the singleuser image either, because mounts are added when each server starts. Changes to `Dockerfile.singleuser` or to `energyguard-sdk/` need a rebuild of the singleuser image. In both cases, users with a running server must stop and start it to get the change.
 
 ---
 
@@ -286,15 +314,13 @@ JupyterHub/
 ├── docker-compose.yml          # Hub container orchestration
 ├── Dockerfile                  # Hub image (JupyterHub + DockerSpawner)
 ├── Dockerfile.singleuser       # Singleuser image (JupyterLab + kernel + SDK)
-├── jupyterhub_config.py        # Hub configuration (auth, spawner, volumes, hooks)
-├── .env.example                # Example hub environment variables
-├── energyguard-sdk/            # Custom SDK for MLflow SSO
-│   ├── pyproject.toml          # Package metadata
-│   ├── sitecustomize.py        # Auto-init on Python startup
-│   └── mlflow_sso/
-│       ├── __init__.py
-│       └── sso.py              # Token injection and request patching
-└── python_env_files/           # Legacy scripts (superseded by SDK)
-    ├── mlflow_authtoken.py
-    └── sitecustomize.py
+├── jupyterhub_config.py        # Hub configuration (auth, logout, spawner, volumes, hooks)
+├── .env.example                # Example Hub environment variables
+└── energyguard-sdk/            # SDK for MLflow login
+    ├── pyproject.toml          # Package metadata
+    ├── sitecustomize.py        # Runs at Python startup
+    └── mlflow_sso/
+        ├── __init__.py
+        ├── token_manager.py    # MLflow personal access token
+        └── sso.py              # Bearer token fallback (requests patch)
 ```

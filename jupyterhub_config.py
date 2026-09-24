@@ -426,15 +426,6 @@ class _BCLogoutHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
-        revocations = _read_revocations()
-        self._json(200, {
-            "endpoint": "/backchannel-logout",
-            "method": "POST",
-            "status": "ready",
-            "pending_revocations": list(revocations.keys()),
-        })
-
     def do_POST(self):
         _bcl_logger.info("=== BACKCHANNEL LOGOUT POST RECEIVED ===")
         _bcl_logger.info("Client: %s", self.client_address)
