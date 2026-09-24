@@ -14,35 +14,41 @@ JupyterHub runs as a **Docker based deployment** with two container images.
 The Hub uses **DockerSpawner** to start an isolated Docker container for each user on demand. All containers share the Docker network `nginxproxy_energyguard_net` and sit behind an Nginx reverse proxy.
 
 ```
-                    ┌─────────────────┐
-                    │  Nginx Reverse  │
-                    │     Proxy       │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │   JupyterHub    │
-                    │  (Hub Container)│
-                    │  - Auth (OIDC)  │
-                    │  - DockerSpawner│
-                    └────────┬────────┘
-                             │  spawns via Docker
-              ┌──────────────┼─────────────┐
-              │              │             │
-        ┌─────▼──────┐ ┌─────▼─────┐ ┌─────▼─────┐
-        │ Singleuser │ │ Singleuser│ │ Singleuser│
-        │  User A    │ │  User B   │ │  User C   │
-        │(JupyterLab)│ │           │ │           │
-        │            │ │           │ │           │
-        └─────┬──────┘ └─────┬─────┘ └─────┬─────┘
-              │              │             │
-              └──────────────┼─────────────┘
-                             │  read-only bind-mount
-                    ┌────────▼─────────────────┐
-                    │  pilot_datasets/         │
-                    │  ONE shared copy on disk │
-                    │  (nightly export by DMS) │
-                    └──────────────────────────┘
+                          ┌─────────────────┐
+                          │  Nginx Reverse  │
+                          │      Proxy      │
+                          └────────┬────────┘
+                          ┌────────▼────────┐
+                          │    JupyterHub   │
+                          │ (Hub Container) │
+                          │  - Auth (OIDC)  │
+                          │ - DockerSpawner │
+                          └────────┬────────┘
+                                   │ spawns via Docker
+            ┌──────────────────────┼──────────────────────┐
+  ┌─────────▼─────────┐  ┌─────────▼─────────┐  ┌─────────▼─────────┐
+  │     Singleuser    │  │     Singleuser    │  │     Singleuser    │
+  │       User A      │  │       User B      │  │       User C      │
+  │    (JupyterLab)   │  │    (JupyterLab)   │  │    (JupyterLab)   │
+  └────┬──────────┬───┘  └────┬──────────┬───┘  └────┬──────────┬───┘
+       │          │           │          │           │          │
+  ┌────▼───────┐  │      ┌────▼───────┐  │      ┌────▼───────┐  │
+  │User A only │  │      │User B only │  │      │User C only │  │
+  │work/     rw│  │      │work/     rw│  │      │work/     rw│  │
+  │datasets  ro│  │      │datasets  ro│  │      │datasets  ro│  │
+  │notebooks rw│  │      │notebooks rw│  │      │notebooks rw│  │
+  │auth      rw│  │      │auth      rw│  │      │auth      rw│  │
+  └────────────┘  │      └────────────┘  │      └────────────┘  │
+                  └──────────────────────┼──────────────────────┘
+                                         │ read-only, shared
+                           ┌─────────────▼────────────┐
+                           │     pilot_datasets/      │
+                           │ ONE shared copy on disk  │
+                           │ (nightly export by DMS)  │
+                           └──────────────────────────┘
 ```
+
+Each singleuser container gets its own `work/` volume and its own `datasets/`, `notebooks/` and `auth/` directories, which no other user can see. All containers also mount the one shared copy of the pilot data. The paths are listed in [Datasets and Notebooks Volumes](#datasets-and-notebooks-volumes).
 
 ---
 
