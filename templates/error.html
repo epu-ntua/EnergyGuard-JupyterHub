@@ -1,0 +1,71 @@
+{#
+  EnergyGuard error page. Same as JupyterHub's own error page, except for
+  429 (too many servers running, or too many starting at once): users get a
+  plain explanation and a "Try again" button instead of
+  "429 : Too Many Requests".
+  active_server_limit comes from c.JupyterHub.template_vars (jupyterhub_config.py).
+#}
+{% extends "templates/error.html" %}
+
+{% block h1_error %}
+{% if status_code == 429 %}
+<h1>EnergyGuard is busy right now</h1>
+{% else %}
+{{ super() }}
+{% endif %}
+{% endblock h1_error %}
+
+{% block error_detail %}
+{% if status_code == 429 %}
+<div class="eg-busy">
+  {% if message and "Active user limit" in message %}
+  <p class="lead">
+    All {{ active_server_limit or "the" }} places for running notebook servers are in use,
+    so your server could not be started.
+  </p>
+  <p>
+    Your files and environments are safe. A place frees up as soon as another user
+    stops their server; servers that are left idle are stopped automatically after an hour.
+  </p>
+  {% else %}
+  <p class="lead">
+    Many users are starting their servers at the same moment, so yours could not be started.
+  </p>
+  {% endif %}
+  <p>Please try again in a few minutes.</p>
+  <p>
+    <a id="eg-try-again" class="btn btn-primary btn-lg" href="">Try again</a>
+    <a class="btn btn-default btn-lg" href="{{ base_url }}home">Back to home</a>
+  </p>
+  <p class="text-muted" id="eg-retry-note">Trying again automatically in <span id="eg-countdown">60</span> seconds.</p>
+</div>
+{% else %}
+{{ super() }}
+{% endif %}
+{% endblock error_detail %}
+
+{% block script %}
+{{ super() }}
+{% if status_code == 429 %}
+<script type="text/javascript">
+  (function () {
+    // "Try again" and the automatic retry reload this page, which asks for the server again.
+    var button = document.getElementById("eg-try-again");
+    button.addEventListener("click", function (e) {
+      e.preventDefault();
+      window.location.reload();
+    });
+    var left = 60;
+    var counter = document.getElementById("eg-countdown");
+    var timer = setInterval(function () {
+      left -= 1;
+      counter.textContent = left;
+      if (left <= 0) {
+        clearInterval(timer);
+        window.location.reload();
+      }
+    }, 1000);
+  })();
+</script>
+{% endif %}
+{% endblock %}

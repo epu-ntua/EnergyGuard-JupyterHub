@@ -6,12 +6,14 @@ services:
     env_file:
       - .env
     ports:
-      - "8009:8009"
-      - "8002:8002"
+      - "127.0.0.1:8009:8009"
+      - "127.0.0.1:8002:8002"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:rw"
       - "jhub_data:/srv/jupyterhub"
       - ./jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
+      # Custom page templates (error.html: the "busy, try again" page at the server limit).
+      - ./templates:/srv/jupyterhub/templates:ro
       # Shared data dir: DMS writes here; pre_spawn_hook creates per-user subdirs
       # so that DockerSpawner can bind-mount them into singleuser containers.
       - /mnt/datadisk/volumes/jupyterhub_data:/jupyterhub_data

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Create a Python environment and register it as a Jupyter kernel.
+#
+# Environments live in ~/.local/envs and kernelspecs in
+# ~/.local/share/jupyter/kernels. ~/.local is a persistent per-user volume,
+# so the kernel is still there after the server stops and starts again.
+#
+# By default the new environment is based on the EnergyGuard kernel: it can
+# import every package of "EnergyGuard (Python)" (torch, mlflow, darts, the
+# SDK, ...) without copying them, and packages installed into it with pip
+# override the inherited ones only inside this environment.
+#
+# Usage:
+#   eg-new-kernel <name> [--display-name "Shown name"] [--clean]
+#       shown in the launcher as "<name> (Shown name)"; without --display-name
+#       as "<name> (EnergyGuard)", or "<name>" with --clean
+#   eg-new-kernel --remove <name>
+#   eg-new-kernel --list
+set -euo pipefail
+
+BASE_PYTHON=/opt/conda/bin/python
+ENVS_DIR="${HOME}/.local/envs"
+
+usage() {
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+name=""
+display=""
+clean=0
+action=create
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage 0 ;;
+        --clean) clean=1; shift ;;
+        --display-name) display="${2:?--display-name needs a value}"; shift 2 ;;
+        --remove) action=remove; name="${2:?--remove needs a name}"; shift 2 ;;
+        --list) action=list; shift ;;
+        -*) echo "Unknown option: $1" >&2; usage 1 ;;
+        *) [[ -z "$name" ]] || { echo "Only one name allowed" >&2; usage 1; }; name="$1"; shift ;;
+    esac
+done
+
+if [[ "$action" == list ]]; then
+    jupyter kernelspec list
+    exit 0
+fi
+
+[[ -n "$name" ]] || usage 1
+if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Invalid name '$name': use letters, digits, '.', '_' or '-'." >&2
+    exit 1
+fi
+if [[ "$name" == eg-default || "$name" == python3 ]]; then
+    echo "'$name' is reserved." >&2
+    exit 1
+fi
+
+env_dir="${ENVS_DIR}/${name}"
+
+if [[ "$action" == remove ]]; then
+    jupyter kernelspec remove -y "$name" 2>/dev/null || true
+    rm -rf "$env_dir"
+    echo "Removed kernel and environment '$name'."
+    exit 0
+fi
+
+if [[ -e "$env_dir" ]]; then
+    echo "Environment '$name' already exists at $env_dir (remove it with: eg-new-kernel --remove $name)." >&2
+    exit 1
+fi
+
+# The kernel is always shown under the environment's real name, so users can
+# tell which environment a kernel runs in: "<name> (<display name>)".
+if [[ -n "$display" ]]; then
+    display="${name} (${display})"
+fi
+
+mkdir -p "$ENVS_DIR"
+if [[ "$clean" == 1 ]]; then
+    echo "Creating clean environment '$name'..."
+    "$BASE_PYTHON" -m venv "$env_dir"
+    "$env_dir/bin/pip" install --quiet --upgrade pip ipykernel
+    : "${display:=${name}}"
+else
+    echo "Creating environment '$name' based on EnergyGuard (Python)..."
+    "$BASE_PYTHON" -m venv --system-site-packages "$env_dir"
+    : "${display:=${name} (EnergyGuard)}"
+fi
+
+"$env_dir/bin/python" -m ipykernel install --user --name "$name" --display-name "$display" >/dev/null
+
+cat <<EOF
+Done. Kernel "$display" is registered and will survive server restarts.
+Reload the JupyterLab page if it does not appear in the launcher yet.
+
+Install packages into it from a terminal:
+    $env_dir/bin/pip install <package>
+or from a notebook running this kernel:
+    %pip install <package>
+EOF

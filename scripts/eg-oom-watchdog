@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Make the memory limit act per notebook: when the container reaches its
+# memory limit, the notebook kernel that uses the memory is killed, not the
+# server.
+#
+# Docker enforces the limit (DockerSpawner mem_limit) on the container's
+# cgroup, and the kernel's OOM killer then kills one process: the one with
+# the highest badness score (memory use + oom_score_adj). This watchdog runs
+# in the background from a before-notebook.d hook and, every few seconds,
+# sets oom_score_adj=1000 on every notebook kernel and the processes it
+# started (multiprocessing workers, DataLoader workers, ...). Those are then
+# always picked before the Jupyter server, terminals and this script, so the
+# server keeps running. Jupyter sees the kernel die and restarts it; the user
+# gets "The kernel appears to have died" in that notebook only.
+#
+# Kernels are recognised by their connection file argument
+# (.../runtime/kernel-<id>.json), so kernels from user environments
+# (eg-new-kernel, conda) are covered as well.
+set -u
+
+POLL_SECONDS="${EG_OOM_POLL_SECONDS:-2}"
+KERNEL_ADJ=1000
+
+oom_kills() {
+    if [[ -r /sys/fs/cgroup/memory.events ]]; then                 # cgroup v2
+        awk '$1 == "oom_kill" { print $2 }' /sys/fs/cgroup/memory.events
+    elif [[ -r /sys/fs/cgroup/memory/memory.oom_control ]]; then   # cgroup v1
+        awk '$1 == "oom_kill" { print $2 }' /sys/fs/cgroup/memory/memory.oom_control
+    fi
+}
+
+log() { echo "[eg-oom-watchdog] $*" >&2; }
+
+# Set oom_score_adj on kernels and all their descendants.
+mark_kernels() {
+    local -A parent=() is_kernel=()
+    local d pid stat rest fields cmd p adj
+
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        { read -r stat < "$d/stat"; } 2>/dev/null || continue
+        # Fields after "(comm) ": state ppid ...; comm may contain spaces.
+        rest="${stat##*) }"
+        read -r -a fields <<< "$rest"
+        parent[$pid]="${fields[1]}"
+        cmd="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" || continue
+        if [[ "$cmd" =~ kernel-[0-9a-fA-F-]+\.json ]]; then
+            is_kernel[$pid]=1
+        fi
+    done
+
+    for pid in "${!parent[@]}"; do
+        p="$pid"
+        while [[ -n "$p" && "$p" != 0 && "$p" != 1 ]]; do
+            if [[ -n "${is_kernel[$p]:-}" ]]; then
+                { read -r adj < "/proc/$pid/oom_score_adj"; } 2>/dev/null || break
+                if (( adj < KERNEL_ADJ )); then
+                    echo "$KERNEL_ADJ" > "/proc/$pid/oom_score_adj" 2>/dev/null
+                fi
+                break
+            fi
+            p="${parent[$p]:-}"
+        done
+    done
+}
+
+last="$(oom_kills)"
+if [[ -z "$last" ]]; then
+    log "no cgroup memory events found, watchdog disabled"
+    exit 0
+fi
+
+limit_desc="unknown"
+if [[ -n "${MEM_LIMIT:-}" ]]; then
+    limit_desc="$(( MEM_LIMIT / 1024 / 1024 )) MiB"
+fi
+log "notebook kernels will be killed first on out-of-memory (limit: ${limit_desc})"
+
+while true; do
+    mark_kernels
+    current="$(oom_kills)"
+    if (( ${current:-0} > ${last:-0} )); then
+        log "memory limit (${limit_desc}) reached — a notebook kernel was killed, the server keeps running"
+        last="$current"
+    fi
+    sleep "$POLL_SECONDS"
+done

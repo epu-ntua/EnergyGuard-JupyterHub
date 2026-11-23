@@ -20,20 +20,74 @@ RUN pip install --no-cache-dir --timeout 120 --retries 10 \
     scikit-learn==1.8.0 \
     tqdm==4.67.1\
     requests==2.32.5\
-    pytorch_lightning==2.6.1
+    pytorch_lightning==2.6.1 \
+    u8darts==0.39.0 \
+    statsforecast==2.1.1 \
+    xgboost==3.2.0
 
-# Copy SDK source into image and install it
+# Build the SDK once into a wheel and install it. The wheel stays in
+# /opt/energyguard-sdk (read-only for users) so users can add the SDK to their
+# own --clean environments:
+#     ~/.local/envs/<env>/bin/pip install /opt/energyguard-sdk/energyguard_sdk-0.1.0-py3-none-any.whl
+# Installing from the source folder does not work for users: pip builds a source
+# folder in place (egg-info), and a root-owned folder is not writable for them.
 COPY energyguard-sdk /tmp/energyguard-sdk
-RUN pip install --no-cache-dir /tmp/energyguard-sdk
+RUN pip wheel --no-cache-dir --no-deps -w /opt/energyguard-sdk /tmp/energyguard-sdk && \
+    pip install --no-cache-dir /opt/energyguard-sdk/energyguard_sdk-*.whl && \
+    rm -rf /tmp/energyguard-sdk && \
+    chmod -R a+rX,go-w /opt/energyguard-sdk
 
 RUN python -m ipykernel install \
     --name eg-default \
     --display-name "EnergyGuard (Python)" \
     --prefix=/usr/local
 
-RUN mkdir -p /etc/jupyter && \
-    printf "c.MappingKernelManager.default_kernel_name = 'eg-default'\n" \
-      > /etc/jupyter/jupyter_server_config.py
+# Server config: default kernel, and a size limit on files opened in the
+# browser (a large CSV in the viewer runs the server out of memory).
+COPY --chmod=0644 scripts/jupyter_server_config.py /etc/jupyter/jupyter_server_config.py
+
+# User environments and kernels. ~/.local is mounted as a persistent per-user
+# volume (see jupyterhub_config.py), so everything below survives restarts:
+#   - kernelspecs:  ~/.local/share/jupyter/kernels  (ipykernel install --user)
+#   - venvs:        ~/.local/envs                    (eg-new-kernel)
+#   - conda envs:   ~/.local/conda-envs              (conda create -n ...)
+# The directories are created here, owned by jovyan, so that Docker copies
+# them with the right ownership into each new volume.
+RUN mkdir -p /home/${NB_USER}/.local/share/jupyter/kernels \
+             /home/${NB_USER}/.local/envs \
+             /home/${NB_USER}/.local/conda-envs && \
+    chown -R ${NB_UID}:${NB_GID} /home/${NB_USER}/.local && \
+    conda config --system --prepend envs_dirs /home/${NB_USER}/.local/conda-envs
+COPY --chmod=0755 scripts/eg-new-kernel /usr/local/bin/eg-new-kernel
+
+# When the container reaches its memory limit, kill the notebook kernel that
+# uses the memory, not the server. start.sh sources before-notebook.d/*.sh on
+# every start.
+COPY --chmod=0755 scripts/eg-oom-watchdog /usr/local/bin/eg-oom-watchdog
+COPY --chmod=0644 scripts/before-notebook.d/10-energyguard.sh /usr/local/bin/before-notebook.d/10-energyguard.sh
+
+# Make the EnergyGuard kernel read-only. Must stay the last step that
+# installs into the base environment.
+#  - PYTHONNOUSERSITE=1 in its kernelspec: packages in the persistent
+#    ~/.local (pip install --user) are never loaded by this kernel.
+#  - site-packages, bin and conda-meta of /opt/conda are owned by root, so
+#    jovyan cannot install, upgrade or remove packages there (pip or conda).
+#  - pip run from the base Python refuses to install outside a virtualenv
+#    (require-virtualenv). The pip.conf sits in the base prefix, so venvs and
+#    conda envs are not affected.
+# User environments made with eg-new-kernel still see these packages, and can
+# override them inside the environment only.
+RUN python -c "import json, pathlib; \
+p = pathlib.Path('/usr/local/share/jupyter/kernels/eg-default/kernel.json'); \
+d = json.loads(p.read_text()); \
+d.setdefault('env', {})['PYTHONNOUSERSITE'] = '1'; \
+p.write_text(json.dumps(d, indent=1))" && \
+    site_packages="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" && \
+    chown root:root /opt/conda /opt/conda/bin /opt/conda/conda-meta "${site_packages}" && \
+    chmod 0755 /opt/conda /opt/conda/bin /opt/conda/conda-meta "${site_packages}" && \
+    chmod -R a-w /usr/local/share/jupyter/kernels/eg-default && \
+    printf '[global]\nrequire-virtualenv = true\n' > /opt/conda/pip.conf && \
+    chmod 0644 /opt/conda/pip.conf
 
 # RUN mkdir -p /srv/jupyterhub
 # COPY .env.singleuser /srv/jupyterhub/.env.singleuser

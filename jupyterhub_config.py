@@ -44,9 +44,13 @@ c.GenericOAuthenticator.allow_all = True
 c.Authenticator.enable_auth_state = True
 c.Authenticator.refresh_pre_spawn = True
 
-# Check token validity every 30 seconds — the refresh_user hook below will
+# Check token validity every hour — the refresh_user hook below will
 # also check the revocation file written by the backchannel logout server.
-c.OAuthenticator.auth_refresh_age = 30
+# Note: a backchannel logout still deletes the user's OAuth tokens right away
+# (see _delete_user_tokens_via_api), so the notebook server cookie stops
+# working within HubOAuth.cache_max_age; only the Hub UI session waits for
+# the next refresh.
+c.OAuthenticator.auth_refresh_age = 60 * 60
 
 # Logout: redirect to Keycloak end-session endpoint (triggers backchannel to other apps)
 post = "https://jupyterhub.energy-guard.eu/hub/login?next=%2Fhub%2F"
@@ -487,13 +491,36 @@ threading.Thread(target=_start_bcl_server, daemon=True).start()
 # REST API to delete user tokens (invalidating the singleuser cookie).
 # ---------------------------------------------------------------------------
 _BCL_API_TOKEN = os.environ.get("BCL_API_TOKEN", "")
+c.JupyterHub.services = []
 if _BCL_API_TOKEN:
-    c.JupyterHub.services = [
+    c.JupyterHub.services.append(
         {
             "name": "backchannel-logout",
             "api_token": _BCL_API_TOKEN,
         }
-    ]
+    )
+
+# ---------------------------------------------------------------------------
+# Idle culler — stop singleuser servers after 1 hour without activity.
+# Activity is what the singleuser server reports to the Hub (browser traffic,
+# running/busy kernels). Checked every 5 minutes, so a server stops between
+# 60 and 65 minutes after its last activity. Data in the user's volumes is kept.
+# ---------------------------------------------------------------------------
+import sys
+
+IDLE_CULL_TIMEOUT = int(os.environ.get("IDLE_CULL_TIMEOUT", "3600"))
+c.JupyterHub.services.append(
+    {
+        "name": "idle-culler",
+        "command": [
+            sys.executable,
+            "-m",
+            "jupyterhub_idle_culler",
+            f"--timeout={IDLE_CULL_TIMEOUT}",
+            "--cull-every=300",
+        ],
+    }
+)
 
 c.JupyterHub.load_roles = [
     {
@@ -506,6 +533,16 @@ c.JupyterHub.load_roles = [
             "users:activity!user",
             "access:servers!server",
             "admin:auth_state!user",
+        ],
+    },
+    {
+        "name": "idle-culler",
+        "services": ["idle-culler"],
+        "scopes": [
+            "list:users",
+            "read:users:activity",
+            "read:servers",
+            "delete:servers",
         ],
     },
 ]
@@ -624,7 +661,39 @@ c.JupyterHub.spawner_class = DockerSpawner
 c.DockerSpawner.image = os.environ.get("DOCKER_NOTEBOOK_IMAGE")
 notebook_dir = "/home/jovyan/work"
 c.DockerSpawner.notebook_dir = notebook_dir
-c.DockerSpawner.volumes = {"jhub-user-{username}": notebook_dir}
+c.DockerSpawner.volumes = {
+    "jhub-user-{username}": notebook_dir,
+    # Persists ~/.local across server restarts: user kernelspecs
+    # (~/.local/share/jupyter/kernels), user-created environments
+    # (~/.local/envs, ~/.local/conda-envs) and `pip install --user` packages.
+    # Without this, custom kernels vanish whenever the container is removed.
+    "jhub-user-{username}-local": "/home/jovyan/.local",
+}
+
+# Resource limits: each singleuser container may use at most 3 GB of RAM.
+# memswap_limit == mem_limit disables swap on top of it, so 3 GB is a hard
+# cap. When it is reached, only the notebook kernel that is using the memory
+# is OOM-killed (eg-oom-watchdog in the image makes kernels the OOM killer's
+# first choice); the server keeps running and Jupyter restarts the kernel.
+SINGLEUSER_MEM_LIMIT = os.environ.get("SINGLEUSER_MEM_LIMIT", "3G")
+c.DockerSpawner.mem_limit = SINGLEUSER_MEM_LIMIT
+c.DockerSpawner.extra_host_config = {"memswap_limit": SINGLEUSER_MEM_LIMIT}
+# At most 1 CPU core per singleuser container (a CFS quota, not pinning).
+c.DockerSpawner.cpu_limit = float(os.environ.get("SINGLEUSER_CPU_LIMIT", "1"))
+
+# ---- Active server limit -------------------------------------------------------
+# At most ACTIVE_SERVER_LIMIT singleuser servers run at the same time (default 12;
+# 0 = no limit). One more user trying to start a server gets HTTP 429, which
+# templates/error.html turns into a "busy, try again" page with a Try again button
+# and an automatic retry after a minute. Admins count towards the limit too.
+ACTIVE_SERVER_LIMIT = int(os.environ.get("ACTIVE_SERVER_LIMIT", "12"))
+c.JupyterHub.active_server_limit = ACTIVE_SERVER_LIMIT
+# Custom templates (error.html) live next to this file, in templates/.
+c.JupyterHub.template_paths = [str(Path(os.environ.get(
+    "JUPYTERHUB_TEMPLATES_DIR", "/srv/jupyterhub/templates")))]
+c.JupyterHub.template_vars = {"active_server_limit": ACTIVE_SERVER_LIMIT}
+# ---- end active server limit ---------------------------------------------------
+
 singleuser_env = dotenv_values("/srv/env/.env.singleuserr")
 c.DockerSpawner.environment = dict(singleuser_env)
 c.DockerSpawner.network_name = os.environ.get("DOCKER_NETWORK_NAME", "nginxproxy_energyguard_net")
